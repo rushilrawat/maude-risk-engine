@@ -1,2 +1,17 @@
 # maude-risk-engine
-End-to-end system for analyzing FDA MAUDE adverse event data to detect high-risk medical device failure patterns using severity-weighted metrics and unsupervised learning.
+Reproducible FDA MAUDE reporting-signal analysis and triage system for identifying medical device failure patterns. It is not a clinical risk estimator.
+
+## Setup
+
+Install the project and development dependencies with:
+
+```bash
+uv sync --all-extras
+cp .env.example .env
+```
+
+Run the full verification suite with:
+
+```bash
+make verify
+```
