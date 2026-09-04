@@ -74,6 +74,36 @@ def test_normalize_preserves_malformed_date_raw_value_and_counts_failure(tmp_pat
     assert result.date_parse_failure_count == 1
 
 
+def test_normalize_preserves_nonempty_whitespace_while_parsing_trimmed_dates(
+    tmp_path: Path,
+) -> None:
+    bronze = tmp_path / "master.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "MDR_REPORT_KEY": ["1", "1", "1"],
+                "DATE_RECEIVED": [" 01/02/2025 ", "01/02/2025", "  "],
+                "EVENT_TYPE": [" NI ", "NI", "   "],
+                "_source_line_number": ["2", "3", "4"],
+                "_source_snapshot_sha256": ["abc", "abc", "abc"],
+                "_source_filename": ["mdrfoi.txt", "mdrfoi.txt", "mdrfoi.txt"],
+            }
+        ),
+        bronze,
+    )
+
+    normalize_bronze(bronze, tmp_path / "silver.parquet", spec_for(TableKind.MASTER), "snapshot-42")
+    padded, canonical, blank = pq.read_table(tmp_path / "silver.parquet").to_pylist()
+
+    assert padded["event_type"] == " NI "
+    assert padded["date_received_raw"] == " 01/02/2025 "
+    assert padded["date_received"] == date(2025, 1, 2)
+    assert blank["event_type"] is None
+    assert blank["date_received_raw"] is None
+    assert blank["date_received"] is None
+    assert padded["record_content_hash"] != canonical["record_content_hash"]
+
+
 @pytest.mark.parametrize(
     ("kind", "fields", "key_columns", "date_column", "expected_date"),
     [

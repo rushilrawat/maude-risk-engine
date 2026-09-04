@@ -37,13 +37,14 @@ def _literal(value: str | Path) -> str:
 
 
 def _normalized_value(source_column: str) -> str:
-    """Normalize an FDA field value while preserving nonempty sentinel strings."""
-    return f"nullif(trim(CAST({_identifier(source_column)} AS VARCHAR)), '')"
+    """Map whitespace-only FDA values to NULL while retaining every other raw string."""
+    source_value = f"CAST({_identifier(source_column)} AS VARCHAR)"
+    return f"CASE WHEN trim({source_value}) = '' THEN NULL ELSE {source_value} END"
 
 
 def _date_value(source_value: str) -> str:
     """Return DuckDB SQL for either accepted FDA source date format."""
-    return f"try_strptime({source_value}, ['%m/%d/%Y', '%Y/%m/%d'])::DATE"
+    return f"try_strptime(trim({source_value}), ['%m/%d/%Y', '%Y/%m/%d'])::DATE"
 
 
 def _assert_unique_output_names(source_columns: tuple[str, ...], spec: TableSpec) -> None:
