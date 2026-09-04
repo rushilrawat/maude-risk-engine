@@ -21,7 +21,6 @@ PROVENANCE_COLUMNS = (
     "_source_snapshot_sha256",
     "_source_filename",
 )
-PARSER_VERSION = "1.0.0"
 
 
 def _temporary_sibling(path: Path) -> Path:
@@ -53,6 +52,7 @@ def _write_reject(
     row: Sequence[str],
     source_snapshot_sha256: str,
     source_filename: str,
+    parser_version: str,
 ) -> None:
     """Write a compact JSONL description of one rejected source record."""
     handle.write(
@@ -65,7 +65,7 @@ def _write_reject(
                 "raw_row": "|".join(row)[:2000],
                 "source_snapshot_sha256": source_snapshot_sha256,
                 "source_filename": source_filename,
-                "parser_version": PARSER_VERSION,
+                "parser_version": parser_version,
             },
             separators=(",", ":"),
         )
@@ -84,6 +84,7 @@ def parse_to_bronze(
     target_path: Path,
     reject_path: Path,
     batch_rows: int,
+    parser_version: str = "1.0.0",
 ) -> BronzeResult:
     """Stream a pipe-delimited FDA source to Bronze Parquet and JSONL rejects."""
     if batch_rows < 1:
@@ -102,14 +103,19 @@ def parse_to_bronze(
     rejects_temporary: Path | None = None
 
     try:
-        with open_source_text(source_path, inspected.member) as source_handle:
+        with open_source_text(
+            source_path,
+            inspected.member,
+            inspected=inspected,
+            encoding=encoding,
+        ) as source_handle:
             reader = csv.reader(source_handle, delimiter="|", quoting=csv.QUOTE_NONE)
             header = tuple(next(reader))
             table = detect_table(source_filename, header)
             columns = header + PROVENANCE_COLUMNS
             schema = pa.schema(
                 [pa.field(column, pa.string(), nullable=True) for column in columns],
-                metadata={b"parser_version": PARSER_VERSION.encode()},
+                metadata={b"parser_version": parser_version.encode()},
             )
             parquet_temporary = _temporary_sibling(target_path)
             rejects_temporary = _temporary_sibling(reject_path)
@@ -135,6 +141,7 @@ def parse_to_bronze(
                             row=row,
                             source_snapshot_sha256=inspected.sha256,
                             source_filename=source_filename,
+                            parser_version=parser_version,
                         )
                         continue
 
@@ -150,6 +157,7 @@ def parse_to_bronze(
                             row=row,
                             source_snapshot_sha256=inspected.sha256,
                             source_filename=source_filename,
+                            parser_version=parser_version,
                         )
                         continue
 

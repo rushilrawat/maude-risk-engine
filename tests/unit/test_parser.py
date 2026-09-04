@@ -9,6 +9,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+import maude.ingestion.archive as archive
 import maude.ingestion.parser as parser
 from maude.ingestion.parser import parse_to_bronze
 
@@ -108,7 +109,7 @@ def test_parser_checks_business_keys_against_normalized_original_headers(tmp_pat
     ).read_text(encoding="utf-8")
 
 
-def test_parser_makes_rejected_rows_attributable_to_the_source_and_parser(
+def test_parser_uses_the_configured_version_for_accepted_and_rejected_provenance(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "patient.txt"
@@ -119,15 +120,46 @@ def test_parser_makes_rejected_rows_attributable_to_the_source_and_parser(
         tmp_path / "bronze.parquet",
         tmp_path / "rejects.jsonl",
         batch_rows=1,
+        parser_version="review-version-2026.09",
     )
 
     rejected = json.loads((tmp_path / "rejects.jsonl").read_text(encoding="utf-8"))
     metadata = pq.read_table(tmp_path / "bronze.parquet").schema.metadata
     assert rejected["source_snapshot_sha256"] == result.source.sha256
     assert rejected["source_filename"] == "patient.txt"
-    assert rejected["parser_version"] == parser.PARSER_VERSION
+    assert rejected["parser_version"] == "review-version-2026.09"
     assert metadata is not None
-    assert metadata[b"parser_version"] == parser.PARSER_VERSION.encode()
+    assert metadata[b"parser_version"] == b"review-version-2026.09"
+
+
+def test_parser_reuses_its_initial_source_inspection_for_streaming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "patient.txt"
+    source.write_text("MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER\n1|1\n", encoding="utf-8")
+    initial_inspection = archive.inspect_source(source)
+    parser_inspections: list[Path] = []
+
+    def inspect_once(path: Path) -> object:
+        parser_inspections.append(path)
+        return initial_inspection
+
+    def fail_second_inspection(path: Path) -> object:
+        raise AssertionError(f"source inspected twice: {path}")
+
+    monkeypatch.setattr(parser, "inspect_source", inspect_once)
+    monkeypatch.setattr(archive, "inspect_source", fail_second_inspection)
+
+    result = parse_to_bronze(
+        source,
+        tmp_path / "bronze.parquet",
+        tmp_path / "rejects.jsonl",
+        batch_rows=1,
+    )
+
+    assert parser_inspections == [source]
+    assert result.source.sha256 == initial_inspection.sha256
+    assert pq.read_table(tmp_path / "bronze.parquet").to_pylist()[0]["MDR_REPORT_KEY"] == "1"
 
 
 def test_parser_emits_empty_parquet_with_full_schema(tmp_path: Path) -> None:

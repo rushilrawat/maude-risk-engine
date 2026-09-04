@@ -76,16 +76,27 @@ def inspect_source(path: Path) -> InspectedSource:
 
 
 @contextmanager
-def open_source_text(path: Path, member: str | None = None) -> Iterator[TextIO]:
+def open_source_text(
+    path: Path,
+    member: str | None = None,
+    *,
+    inspected: InspectedSource | None = None,
+    encoding: str | None = None,
+) -> Iterator[TextIO]:
     """Open a source as strict text while streaming its underlying bytes."""
-    inspected = inspect_source(path)
+    path = Path(path)
+    if inspected is None:
+        inspected = inspect_source(path)
+    elif inspected.path != path:
+        raise ArchiveValidationError("provided inspection does not match source path")
     selected = inspected.member
     if member is not None and member != selected:
         raise ArchiveValidationError(
             f"requested member {member!r} does not match inspected member {selected!r}"
         )
 
-    encoding = select_encoding(inspected.sample)
+    if encoding is None:
+        encoding = select_encoding(inspected.sample)
     if selected is None:
         with (
             Path(path).open("rb") as raw_file,
