@@ -1,6 +1,6 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -124,3 +124,30 @@ class LocalAuditResult(ContractModel):
     items: Sequence[LocalAuditItem]
     quality: Sequence[QualityResult]
     has_blocking_failure: bool
+
+
+class NarrativeEvidence(ContractModel):
+    """One narrative row with enough source information to cite it exactly."""
+
+    model_config = ConfigDict(frozen=True)
+
+    evidence_id: str
+    text_type_code: str | None
+    text: str
+    source_filename: str
+    source_line_number: int
+
+
+class ReportDocument(ContractModel):
+    """Immutable report metadata and provenance-preserving narrative evidence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    report_id: str
+    reported_event_type: str | None
+    date_received: date | None
+    product_codes: tuple[str, ...]
+    brand_names: tuple[str, ...]
+    manufacturers: tuple[str, ...]
+    narratives: tuple[NarrativeEvidence, ...]
+    dataset_snapshot_id: str
