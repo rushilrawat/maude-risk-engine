@@ -100,6 +100,19 @@ def audit_local_sources(source_root: Path) -> LocalAuditResult:
                 inspected = inspect_source(archive)
                 if inspected.member is None:
                     raise ValueError("canonical source must be a ZIP archive member")
+                if _is_add_file(Path(inspected.member)):
+                    global_quality.append(
+                        _quality(
+                            "additive_archive_member",
+                            QualityLevel.BLOCKING,
+                            False,
+                            f"archive {archive.name} contains additive member "
+                            f"{inspected.member}; it cannot substitute for a base table",
+                            archive=str(archive),
+                            member=inspected.member,
+                        )
+                    )
+                    continue
                 encoding = select_source_encoding(archive, inspected)
                 header = _header(archive, inspected.member, encoding)
                 spec = detect_table(inspected.member, header)

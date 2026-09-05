@@ -1,8 +1,10 @@
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pytest
 from typer.testing import CliRunner
 
+import maude.ingestion.pipeline as pipeline
 from maude.cli import app
 
 
@@ -79,6 +81,26 @@ def test_audit_local_uses_schema_and_never_substitutes_add_files(tmp_path: Path)
     assert any("missing required tables: patient" in item.message for item in result.quality)
 
 
+def test_audit_local_rejects_additive_member_in_a_neutral_archive_name(tmp_path: Path) -> None:
+    from maude.service.audit import audit_local_sources
+
+    source_root = _complete_archive_root(tmp_path / "sources")
+    (source_root / "patient.zip").unlink()
+    _write_archive(
+        source_root,
+        "current.zip",
+        "patient_add.txt",
+        "MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER",
+        "1|99\n",
+    )
+
+    result = audit_local_sources(source_root)
+
+    assert result.has_blocking_failure is True
+    assert all(item.table.value != "patient" for item in result.items)
+    assert any("missing required tables: patient" in item.message for item in result.quality)
+
+
 def test_ingest_local_prints_promoted_snapshot(tmp_path: Path) -> None:
     source_root = _complete_archive_root(tmp_path / "sources")
     data_root = tmp_path / "data"
@@ -124,3 +146,34 @@ def test_ingest_local_allows_archive_only_after_invalid_conversion(tmp_path: Pat
     assert result.exit_code == 0
     assert "ignored invalid conversion" in result.stdout.lower()
     assert "PROMOTED fixture-2025-06" in result.stdout
+
+
+def test_ingest_local_refuses_success_when_current_pointer_publication_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = _complete_archive_root(tmp_path / "sources")
+    data_root = tmp_path / "data"
+    original_write = pipeline.write_manifest
+
+    def fail_current_pointer(path: Path, snapshot: object) -> None:
+        if path == data_root / "manifests" / "current.json":
+            raise OSError("simulated current pointer failure")
+        original_write(path, snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline, "write_manifest", fail_current_pointer)
+    result = CliRunner().invoke(
+        app,
+        [
+            "ingest-local",
+            "fixture-2025-06",
+            "--source-root",
+            str(source_root),
+            "--data-root",
+            str(data_root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "incomplete" in result.stdout.lower()
+    assert "PROMOTED fixture-2025-06" not in result.stdout
+    assert not (data_root / "manifests" / "current.json").exists()

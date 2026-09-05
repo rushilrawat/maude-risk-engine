@@ -52,11 +52,13 @@ promotion completes.
 
 ## Failures and retries
 
-On a blocking source or pipeline result, inspect the failed manifest and its
-quality report, correct or replace the source input, then rerun with the same
-snapshot ID only when its canonical archive checksums are unchanged. A retry
-recovers an interrupted promotion but a different checksum for an existing
-snapshot ID is deliberately rejected.
+An audit-only refusal creates no manifest and can be rerun after its source
+finding is addressed. For a terminal `FAILED` quality or pipeline manifest,
+inspect its report, correct or replace the source input, and use a new snapshot
+ID: the old terminal snapshot is immutable. Reuse the same snapshot ID only to
+reconcile an interrupted promotion intent (for example, an `INCOMPLETE`
+current-pointer publication); a different checksum for an existing snapshot ID
+is deliberately rejected.
 
 To confirm a failed run did not move the current pointer, compare the snapshot
 ID before and after the attempt:

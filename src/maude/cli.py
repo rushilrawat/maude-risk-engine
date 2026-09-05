@@ -6,6 +6,7 @@ from maude import __version__
 from maude.config import Settings
 from maude.domain.enums import QualityLevel, RunStatus
 from maude.domain.models import LocalAuditItem, LocalAuditResult
+from maude.ingestion.manifests import load_manifest
 from maude.ingestion.pipeline import ingest_snapshot
 from maude.quality.report import render_quality_markdown
 from maude.service.audit import audit_local_sources, blocking_findings, selected_archives
@@ -55,6 +56,16 @@ def blocking_findings_for_item(item: LocalAuditItem) -> tuple[object, ...]:
     )
 
 
+def _current_points_at_snapshot(layout: SnapshotLayout, snapshot_id: str) -> bool:
+    if not layout.current_manifest.is_file():
+        return False
+    try:
+        current = load_manifest(layout.current_manifest)
+    except (OSError, ValueError):
+        return False
+    return current.snapshot_id == snapshot_id and current.status is RunStatus.PROMOTED
+
+
 @app.command("audit-local")
 def audit_local(
     data_root: Path = typer.Option(  # noqa: B008
@@ -102,8 +113,19 @@ def ingest_local(
         f"{table.table.value}={table.stats.rows_accepted}/{table.stats.rows_rejected}"
         for table in snapshot.tables
     )
-    if snapshot.status is RunStatus.PROMOTED:
+    if (
+        snapshot.status is RunStatus.PROMOTED
+        and snapshot.promotion is None
+        and _current_points_at_snapshot(layout, snapshot.snapshot_id)
+    ):
         typer.echo(f"PROMOTED {snapshot.snapshot_id} {snapshot.promoted_path} counts: {counts}")
         return
+    if snapshot.status is RunStatus.PROMOTED:
+        phase = snapshot.promotion.phase if snapshot.promotion is not None else "unverified_current"
+        typer.echo(
+            f"INCOMPLETE {snapshot.snapshot_id} promotion is recoverable; "
+            f"current pointer is not finalized (phase={phase}) counts: {counts}"
+        )
+        raise typer.Exit(1)
     typer.echo(f"FAILED {snapshot.snapshot_id} counts: {counts}")
     raise typer.Exit(1)
