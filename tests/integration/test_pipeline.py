@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
 from pathlib import Path
+from queue import Empty
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
@@ -8,6 +10,7 @@ import pytest
 import maude.ingestion.pipeline as pipeline
 from maude.config import Settings
 from maude.domain.enums import QualityLevel, RunStatus, TableKind
+from maude.domain.models import SnapshotResult
 from maude.ingestion.manifests import load_manifest
 from maude.ingestion.pipeline import SnapshotConflict, ingest_snapshot
 from maude.storage.layout import SnapshotLayout
@@ -60,6 +63,21 @@ def _settings(tmp_path: Path) -> Settings:
     return Settings(data_root=tmp_path / "data", batch_rows=1, parser_version="test-parser")
 
 
+def _ingest_worker(
+    data_root: str, sources: tuple[str, ...], snapshot_id: str, ready: object, results: object
+) -> None:
+    ready.wait()  # type: ignore[union-attr]
+    try:
+        result = ingest_snapshot(
+            snapshot_id,
+            tuple(Path(path) for path in sources),
+            Settings(data_root=Path(data_root), batch_rows=1, parser_version="test-parser"),
+        )
+        results.put(("result", result.status.value))  # type: ignore[union-attr]
+    except Exception as error:
+        results.put(("error", type(error).__name__))  # type: ignore[union-attr]
+
+
 def test_ingest_promotes_validated_snapshot_and_persists_manifest(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     result = ingest_snapshot("fixture-2025-06", _sources(tmp_path), settings)
@@ -91,7 +109,17 @@ def test_failed_snapshot_keeps_staging_evidence_and_current_pointer(tmp_path: Pa
     assert failed.status is RunStatus.FAILED
     assert failed_layout.staging.exists()
     assert any(failed_layout.rejects.glob("*.jsonl"))
-    assert load_manifest(failed_layout.manifest).status is RunStatus.FAILED
+    failed_manifest = load_manifest(failed_layout.manifest)
+    assert failed_manifest.status is RunStatus.FAILED
+    assert [table.table for table in failed_manifest.tables] == [
+        TableKind.MASTER,
+        TableKind.DEVICE,
+        TableKind.PATIENT,
+    ]
+    assert failed_manifest.failure is not None
+    assert failed_manifest.failure.table is TableKind.NARRATIVE
+    assert failed_manifest.failure.source_path.endswith("foitext.zip")
+    assert failed_manifest.failure.error_type == "SchemaMismatch"
     assert load_manifest(first_layout.current_manifest).snapshot_id == first.snapshot_id
     assert first_layout.promoted.exists()
 
@@ -154,7 +182,270 @@ def test_cleanup_failure_does_not_rollback_an_already_published_pointer(
     assert load_manifest(layout.current_manifest).status is RunStatus.PROMOTED
 
 
-@pytest.mark.parametrize("snapshot_id", ("../escape", "contains space", "slash/name", ""))
+@pytest.mark.parametrize(
+    "snapshot_id", (".", "..", "../escape", "contains space", "slash/name", "")
+)
 def test_snapshot_id_must_stay_inside_snapshot_layout(tmp_path: Path, snapshot_id: str) -> None:
     with pytest.raises(ValueError, match="snapshot_id"):
         ingest_snapshot(snapshot_id, (), _settings(tmp_path))
+
+
+def test_rejects_symlinked_snapshot_staging_path_before_writing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    layout.staging.parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    layout.staging.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        ingest_snapshot(layout.snapshot_id, _sources(tmp_path / "sources"), settings)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_rejects_symlinked_manifests_root_before_writing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.data_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    settings.data_root.joinpath("manifests").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        ingest_snapshot("fixture-2025-06", _sources(tmp_path / "sources"), settings)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_stale_snapshot_claim_is_recovered_safely(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    stale = settings.data_root / "locks" / "fixture-2025-06.lock"
+    stale.mkdir(parents=True)
+    stale.joinpath("owner.json").write_text('{"pid":99999999}', encoding="utf-8")
+
+    result = ingest_snapshot("fixture-2025-06", _sources(tmp_path / "sources"), settings)
+
+    assert result.status is RunStatus.PROMOTED
+    assert not stale.exists()
+
+
+def test_staging_setup_failure_persists_failed_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    original_mkdir = Path.mkdir
+
+    def fail_staging(self: Path, *args: object, **kwargs: object) -> None:
+        if self == layout.staging:
+            raise OSError("simulated staging mkdir failure")
+        original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_staging)
+    result = ingest_snapshot(layout.snapshot_id, _sources(tmp_path / "sources"), settings)
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.phase == "staging_setup"
+    assert load_manifest(layout.manifest).status is RunStatus.FAILED
+
+
+def test_retry_recovers_after_promoted_manifest_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    sources = _sources(tmp_path / "sources")
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    original_write = pipeline.write_manifest
+    calls = 0
+
+    def fail_once(path: Path, snapshot: SnapshotResult) -> None:
+        nonlocal calls
+        if path == layout.manifest and snapshot.status is RunStatus.PROMOTED and calls == 0:
+            calls += 1
+            raise OSError("simulated promoted manifest failure")
+        original_write(path, snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline, "write_manifest", fail_once)
+    first = ingest_snapshot(layout.snapshot_id, sources, settings)
+    assert first.status is RunStatus.FAILED
+    assert layout.staging.exists()
+
+    monkeypatch.setattr(pipeline, "write_manifest", original_write)
+    recovered = ingest_snapshot(layout.snapshot_id, sources, settings)
+    assert recovered.status is RunStatus.PROMOTED
+    assert load_manifest(layout.current_manifest).snapshot_id == layout.snapshot_id
+
+
+def test_retry_recovers_when_pointer_publication_fails_without_overwriting_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    prior = ingest_snapshot("fixture-2025-05", _sources(tmp_path / "prior"), settings)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    sources = _sources(tmp_path / "sources")
+    original_write = pipeline.write_manifest
+    failed = False
+
+    def fail_pointer(path: Path, snapshot: object) -> None:
+        nonlocal failed
+        if path == layout.current_manifest and not failed:
+            failed = True
+            raise OSError("simulated pointer failure")
+        original_write(path, snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline, "write_manifest", fail_pointer)
+    first = ingest_snapshot(layout.snapshot_id, sources, settings)
+    assert first.status is RunStatus.PROMOTED
+    assert load_manifest(layout.current_manifest).snapshot_id == prior.snapshot_id
+
+    monkeypatch.setattr(pipeline, "write_manifest", original_write)
+    recovered = ingest_snapshot(layout.snapshot_id, sources, settings)
+    assert recovered.status is RunStatus.PROMOTED
+    assert load_manifest(layout.current_manifest).snapshot_id == layout.snapshot_id
+
+
+def test_directory_rename_failure_persists_failed_snapshot_and_keeps_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    prior = ingest_snapshot("fixture-2025-05", _sources(tmp_path / "prior"), settings)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    original_replace = Path.replace
+
+    def fail_promotion(source: Path, target: Path) -> Path:
+        if source == layout.silver and target == layout.promoted:
+            raise OSError("simulated promotion rename failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", fail_promotion)
+    result = ingest_snapshot(layout.snapshot_id, _sources(tmp_path / "sources"), settings)
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.phase == "promotion"
+    assert load_manifest(layout.current_manifest).snapshot_id == prior.snapshot_id
+    assert layout.staging.joinpath("silver").exists()
+
+
+def test_rollback_failure_leaves_recoverable_validated_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    original_replace = Path.replace
+    original_write = pipeline.write_manifest
+    sources = _sources(tmp_path / "sources")
+
+    def fail_promoted_manifest(path: Path, snapshot: SnapshotResult) -> None:
+        if path == layout.manifest and snapshot.status is RunStatus.PROMOTED:
+            raise OSError("simulated promoted manifest failure")
+        original_write(path, snapshot)  # type: ignore[arg-type]
+
+    def fail_rollback(source: Path, target: Path) -> Path:
+        if source == layout.promoted and target == layout.silver:
+            raise OSError("simulated rollback rename failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(pipeline, "write_manifest", fail_promoted_manifest)
+    monkeypatch.setattr(Path, "replace", fail_rollback)
+    interrupted = ingest_snapshot(layout.snapshot_id, sources, settings)
+
+    assert interrupted.status is RunStatus.VALIDATED
+    assert interrupted.promotion is not None
+    assert interrupted.promotion.phase == "silver_renamed"
+    assert layout.promoted.exists()
+
+    monkeypatch.setattr(pipeline, "write_manifest", original_write)
+    monkeypatch.setattr(Path, "replace", original_replace)
+    recovered = ingest_snapshot(layout.snapshot_id, sources, settings)
+    assert recovered.status is RunStatus.PROMOTED
+
+
+def test_promotion_directory_rename_fsyncs_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    synced: list[Path] = []
+    original_sync = pipeline.fsync_directory
+    monkeypatch.setattr(pipeline, "fsync_directory", synced.append)
+
+    result = ingest_snapshot(layout.snapshot_id, _sources(tmp_path / "sources"), settings)
+
+    monkeypatch.setattr(pipeline, "fsync_directory", original_sync)
+    assert result.status is RunStatus.PROMOTED
+    assert layout.promoted.parent in synced
+
+
+def test_same_snapshot_concurrent_runs_are_serialized_and_conflicts_are_deterministic(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    sources = _sources(tmp_path / "sources")
+    changed = _sources(tmp_path / "changed", second_master_event="E")
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    results = context.Queue()
+    workers = [
+        context.Process(
+            target=_ingest_worker,
+            args=(
+                str(settings.data_root),
+                tuple(map(str, inputs)),
+                "fixture-2025-06",
+                ready,
+                results,
+            ),
+        )
+        for inputs in (sources, changed)
+    ]
+    for worker in workers:
+        worker.start()
+    ready.set()
+    for worker in workers:
+        worker.join(timeout=20)
+        assert worker.exitcode == 0
+
+    observed: list[tuple[str, str]] = []
+    while True:
+        try:
+            observed.append(results.get_nowait())
+        except Empty:
+            break
+    assert sorted(observed) == [("error", "SnapshotConflict"), ("result", "promoted")]
+
+
+def test_identical_same_snapshot_concurrent_runs_share_one_promoted_result(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    sources = _sources(tmp_path / "sources")
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    results = context.Queue()
+    workers = [
+        context.Process(
+            target=_ingest_worker,
+            args=(
+                str(settings.data_root),
+                tuple(map(str, sources)),
+                "fixture-2025-06",
+                ready,
+                results,
+            ),
+        )
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    ready.set()
+    for worker in workers:
+        worker.join(timeout=20)
+        assert worker.exitcode == 0
+
+    observed: list[tuple[str, str]] = []
+    while True:
+        try:
+            observed.append(results.get_nowait())
+        except Empty:
+            break
+    assert sorted(observed) == [("result", "promoted"), ("result", "promoted")]

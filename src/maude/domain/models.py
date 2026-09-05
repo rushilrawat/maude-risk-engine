@@ -47,6 +47,23 @@ class TableResult(ContractModel):
     quality: Sequence[QualityResult]
 
 
+class FailureEvidence(ContractModel):
+    """Structured provenance retained when a snapshot cannot be published."""
+
+    phase: str
+    table: TableKind | None = None
+    source_path: str | None = None
+    source: SourceIdentity | None = None
+    error_type: str
+    message: str
+
+
+class PromotionIntent(ContractModel):
+    """Durable publication state used to reconcile an interrupted promotion."""
+
+    phase: str
+
+
 class SnapshotResult(ContractModel):
     run_id: UUID
     snapshot_id: str
@@ -57,6 +74,8 @@ class SnapshotResult(ContractModel):
     quality: Sequence[QualityResult]
     promoted_path: str | None
     parser_version: str
+    failure: FailureEvidence | None = None
+    promotion: PromotionIntent | None = None
 
     @field_validator("started_at", "finished_at")
     @classmethod
