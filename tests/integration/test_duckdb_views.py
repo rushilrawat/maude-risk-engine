@@ -5,7 +5,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from maude.storage.duckdb import ReportNotFound, fetch_report_document, open_snapshot
+from maude.storage.duckdb import (
+    ReportNotFound,
+    SnapshotSchemaError,
+    fetch_report_document,
+    open_snapshot,
+)
 
 
 def _write_snapshot(root: Path) -> Path:
@@ -111,6 +116,54 @@ def test_open_snapshot_rejects_missing_artifact_with_actionable_error(tmp_path: 
     (root / "patients.parquet").unlink()
 
     with pytest.raises(FileNotFoundError, match=r"patients\.parquet"):
+        open_snapshot(root)
+
+
+def test_open_snapshot_rejects_mismatched_child_snapshot_id(tmp_path: Path) -> None:
+    root = _write_snapshot(tmp_path / "promoted")
+    narrative_path = root / "narratives.parquet"
+    narrative_table = pq.read_table(narrative_path).to_pylist()
+    for row in narrative_table:
+        row["dataset_snapshot_id"] = "fixture-2025-07"
+    pq.write_table(pa.Table.from_pylist(narrative_table), narrative_path)
+
+    with pytest.raises(SnapshotSchemaError, match=r"narratives.*fixture-2025-07"):
+        open_snapshot(root)
+
+
+def test_open_snapshot_rejects_null_or_multiple_snapshot_ids(tmp_path: Path) -> None:
+    root = _write_snapshot(tmp_path / "promoted")
+    report_path = root / "reports.parquet"
+    report_rows = pq.read_table(report_path).to_pylist()
+    report_rows[0]["dataset_snapshot_id"] = None
+    pq.write_table(pa.Table.from_pylist(report_rows), report_path)
+
+    with pytest.raises(SnapshotSchemaError, match=r"reports.*non-null"):
+        open_snapshot(root)
+
+    report_rows[0]["dataset_snapshot_id"] = "fixture-2025-06"
+    report_rows[1]["dataset_snapshot_id"] = "fixture-2025-07"
+    pq.write_table(pa.Table.from_pylist(report_rows), report_path)
+
+    with pytest.raises(SnapshotSchemaError, match=r"reports.*multiple"):
+        open_snapshot(root)
+
+
+def test_open_snapshot_rejects_duplicate_master_report_ids(tmp_path: Path) -> None:
+    root = _write_snapshot(tmp_path / "promoted")
+    report_path = root / "reports.parquet"
+    report_rows = pq.read_table(report_path).to_pylist()
+    report_rows.append(
+        {
+            "mdr_report_key": "1",
+            "event_type": "E",
+            "date_received": date(2025, 1, 9),
+            "dataset_snapshot_id": "fixture-2025-06",
+        }
+    )
+    pq.write_table(pa.Table.from_pylist(report_rows), report_path)
+
+    with pytest.raises(SnapshotSchemaError, match=r"duplicate.*mdr_report_key.*1"):
         open_snapshot(root)
 
 

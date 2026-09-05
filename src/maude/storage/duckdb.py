@@ -188,6 +188,66 @@ def _create_views(connection: duckdb.DuckDBPyConnection, artifacts: dict[str, Pa
     )
 
 
+def _validate_snapshot_provenance(
+    connection: duckdb.DuckDBPyConnection, artifacts: dict[str, Path]
+) -> None:
+    """Require one non-null snapshot ID consistently across all source tables."""
+    expected_snapshot_id: str | None = None
+    for view_name, path in artifacts.items():
+        row = connection.execute(
+            f"""
+            SELECT COUNT(*)::BIGINT,
+                   COUNT(dataset_snapshot_id)::BIGINT,
+                   COUNT(DISTINCT CAST(dataset_snapshot_id AS VARCHAR))::BIGINT,
+                   MIN(CAST(dataset_snapshot_id AS VARCHAR)),
+                   MAX(CAST(dataset_snapshot_id AS VARCHAR))
+            FROM {view_name}
+            """
+        ).fetchone()
+        if row is None:
+            raise SnapshotSchemaError(
+                f"{view_name} artifact {path} did not return a provenance summary"
+            )
+        total_rows, non_null_rows, distinct_ids, minimum_id, maximum_id = row
+        if total_rows == 0 or non_null_rows != total_rows:
+            raise SnapshotSchemaError(
+                f"{view_name} artifact {path} must contain a non-null "
+                f"dataset_snapshot_id for every row; found "
+                f"{total_rows - non_null_rows} null value(s)"
+            )
+        if distinct_ids != 1:
+            raise SnapshotSchemaError(
+                f"{view_name} artifact {path} contains multiple dataset_snapshot_id values: "
+                f"{minimum_id!r} and {maximum_id!r}"
+            )
+        snapshot_id = str(minimum_id)
+        if expected_snapshot_id is None:
+            expected_snapshot_id = snapshot_id
+        elif snapshot_id != expected_snapshot_id:
+            raise SnapshotSchemaError(
+                f"{view_name} artifact {path} has dataset_snapshot_id {snapshot_id!r}; "
+                f"expected {expected_snapshot_id!r} to match the other snapshot artifacts"
+            )
+
+
+def _validate_report_keys(connection: duckdb.DuckDBPyConnection, artifact: Path) -> None:
+    """Reject duplicate report keys before exposing a document reader."""
+    duplicate = connection.execute(
+        """
+        SELECT CAST(mdr_report_key AS VARCHAR), COUNT(*)::BIGINT
+        FROM reports
+        GROUP BY mdr_report_key
+        HAVING COUNT(*) > 1
+        LIMIT 1
+        """
+    ).fetchone()
+    if duplicate is not None:
+        raise SnapshotSchemaError(
+            f"reports artifact {artifact} contains duplicate mdr_report_key "
+            f"{duplicate[0]!r} ({duplicate[1]} rows)"
+        )
+
+
 def open_snapshot(snapshot_path: Path) -> duckdb.DuckDBPyConnection:
     """Open an in-memory connection exposing one promoted Silver snapshot.
 
@@ -203,6 +263,8 @@ def open_snapshot(snapshot_path: Path) -> duckdb.DuckDBPyConnection:
             _schema_columns(artifact, view_name)
         connection = duckdb.connect(":memory:")
         _create_views(connection, artifacts)
+        _validate_snapshot_provenance(connection, artifacts)
+        _validate_report_keys(connection, artifacts["reports"])
         return connection
     except BaseException:
         if connection is not None:
