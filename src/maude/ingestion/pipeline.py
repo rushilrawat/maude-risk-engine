@@ -1,10 +1,10 @@
 """Snapshot ingestion orchestration with recoverable atomic Silver promotion."""
 
+import fcntl
 import json
 import os
 import re
-import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,6 +16,7 @@ from maude.config import Settings
 from maude.domain.enums import QualityLevel, RunStatus, TableKind
 from maude.domain.models import (
     FailureEvidence,
+    InspectedSource,
     PromotionIntent,
     QualityResult,
     SnapshotResult,
@@ -32,8 +33,7 @@ from maude.quality.checks import has_blocking_failure, run_quality_checks
 from maude.storage.layout import SnapshotLayout
 
 _SNAPSHOT_ID = re.compile(r"[a-zA-Z0-9._-]+\Z")
-_LOCK_WAIT_SECONDS = 30.0
-_LOCK_POLL_SECONDS = 0.05
+_CLAIM_HOOK: Callable[[], None] | None = None
 
 
 class SnapshotConflict(ValueError):
@@ -45,6 +45,7 @@ class _SourceCandidate:
     table: TableKind
     path: Path
     source: SourceIdentity
+    inspected: InspectedSource
 
 
 class _StageFailure(Exception):
@@ -99,70 +100,30 @@ def _prepare_layout(layout: SnapshotLayout) -> Path:
     return locks_root
 
 
-def _owner_is_stale(owner_path: Path) -> bool:
-    try:
-        payload = json.loads(owner_path.read_text(encoding="utf-8"))
-        pid = int(payload["pid"])
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    return False
-
-
-def _remove_stale_lock(lock_path: Path) -> bool:
-    _reject_symlink(lock_path)
-    owner_path = lock_path / "owner.json"
-    _reject_symlink(owner_path)
-    if not _owner_is_stale(owner_path):
-        return False
-    try:
-        owner_path.unlink()
-        lock_path.rmdir()
-    except OSError:
-        return False
-    fsync_directory(lock_path.parent)
-    return True
-
-
 @contextmanager
 def _snapshot_claim(locks_root: Path, snapshot_id: str) -> Iterator[None]:
-    """Hold an exclusive, stale-owner-recoverable claim for one snapshot ID."""
+    """Hold an advisory claim that the OS releases when the owner dies.
+
+    Metadata is informative only: an empty or truncated file is safe because
+    ``flock`` guards the actual exclusion and is released by process death.
+    """
     lock_path = locks_root / f"{snapshot_id}.lock"
     _require_descendant(lock_path, locks_root)
-    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
-    while True:
-        _reject_symlink(lock_path)
-        try:
-            lock_path.mkdir()
-        except FileExistsError:
-            if _remove_stale_lock(lock_path):
-                continue
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for snapshot claim: {snapshot_id}") from None
-            time.sleep(_LOCK_POLL_SECONDS)
-            continue
-        break
-    owner_path = lock_path / "owner.json"
-    try:
-        with owner_path.open("x", encoding="utf-8", newline="\n") as owner:
-            owner.write(
-                json.dumps({"pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()})
-            )
-            owner.flush()
-            os.fsync(owner.fileno())
-        fsync_directory(lock_path)
+    _reject_symlink(lock_path)
+    if lock_path.exists() and lock_path.is_dir():
+        raise ValueError(f"legacy directory claim must be removed safely: {lock_path}")
+    with lock_path.open("a+", encoding="utf-8", newline="\n") as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX)
+        owner.seek(0)
+        owner.truncate()
+        owner.write(json.dumps({"pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()}))
+        owner.flush()
+        os.fsync(owner.fileno())
+        fsync_directory(locks_root)
+        if _CLAIM_HOOK is not None:
+            _CLAIM_HOOK()
         yield
-    finally:
-        with suppress(OSError):
-            owner_path.unlink()
-        with suppress(OSError):
-            lock_path.rmdir()
-            fsync_directory(locks_root)
+        fcntl.flock(owner.fileno(), fcntl.LOCK_UN)
 
 
 def _source_checksums(sources: Sequence[Path]) -> tuple[str, ...]:
@@ -170,7 +131,7 @@ def _source_checksums(sources: Sequence[Path]) -> tuple[str, ...]:
 
 
 def _manifest_checksums(snapshot: SnapshotResult) -> tuple[str, ...]:
-    identities = [table.source for table in snapshot.tables]
+    identities = list(snapshot.inputs) or [table.source for table in snapshot.tables]
     if snapshot.failure is not None and snapshot.failure.source is not None:
         identities.append(snapshot.failure.source)
     return tuple(sorted({identity.sha256 for identity in identities}))
@@ -181,16 +142,19 @@ def _same_sources(snapshot: SnapshotResult, sources: Sequence[Path]) -> bool:
     return bool(expected) and _source_checksums(sources) == expected
 
 
-def _source_identity(path: Path) -> SourceIdentity:
+def _source_identity(path: Path) -> tuple[SourceIdentity, InspectedSource]:
     inspected = inspect_source(path)
     encoding = select_encoding(inspected.sample)
-    return SourceIdentity(
-        path=str(inspected.path),
-        filename=inspected.member or path.name,
-        sha256=inspected.sha256,
-        byte_size=inspected.byte_size,
-        archive_member=inspected.member,
-        encoding=encoding,
+    return (
+        SourceIdentity(
+            path=str(inspected.path),
+            filename=inspected.member or path.name,
+            sha256=inspected.sha256,
+            byte_size=inspected.byte_size,
+            archive_member=inspected.member,
+            encoding=encoding,
+        ),
+        inspected,
     )
 
 
@@ -200,7 +164,7 @@ def _sources_by_table(sources: Sequence[Path]) -> dict[TableKind, _SourceCandida
     for raw_path in sources:
         path = Path(raw_path)
         try:
-            source = _source_identity(path)
+            source, inspected = _source_identity(path)
         except Exception as error:
             raise _StageFailure(
                 error,
@@ -233,8 +197,18 @@ def _sources_by_table(sources: Sequence[Path]) -> dict[TableKind, _SourceCandida
         kind = matches[0].kind
         if kind in discovered:
             raise ValueError(f"multiple sources detected for {kind.value}")
-        discovered[kind] = _SourceCandidate(kind, path, source)
+        discovered[kind] = _SourceCandidate(kind, path, source, inspected)
     return discovered
+
+
+def _prepare_staging(layout: SnapshotLayout) -> None:
+    """Create only contained, real staging leaves before any output writer opens."""
+    _ensure_real_directory(layout.staging)
+    for leaf in (layout.bronze, layout.rejects, layout.silver):
+        _reject_symlink(leaf)
+        _require_descendant(leaf, layout.staging)
+        _ensure_real_directory(leaf)
+        _reject_symlink(leaf)
 
 
 def _date_parse_quality(count: int, accepted_rows: int) -> QualityResult:
@@ -269,6 +243,7 @@ def _process_table(
             layout.rejects / f"{candidate.table.value}.jsonl",
             settings.batch_rows,
             settings.parser_version,
+            candidate.inspected,
         )
         normalization = normalize_bronze(
             Path(bronze.bronze_path),
@@ -346,6 +321,19 @@ def _promoted_snapshot(validated: SnapshotResult, layout: SnapshotLayout) -> Sna
     )
 
 
+def _validate_promoted_artifacts(layout: SnapshotLayout, snapshot: SnapshotResult) -> None:
+    """Require a real promoted directory with every durable-table Parquet artifact."""
+    _reject_symlink(layout.promoted)
+    if not layout.promoted.is_dir():
+        raise ValueError("promoted target is not a real directory")
+    expected = {f"{table.table.value}.parquet" for table in snapshot.tables}
+    for filename in expected:
+        artifact = layout.promoted / filename
+        _reject_symlink(artifact)
+        if not artifact.is_file():
+            raise FileNotFoundError(f"promoted output is missing expected artifact: {filename}")
+
+
 def _finalize_current(layout: SnapshotLayout, promoted: SnapshotResult) -> SnapshotResult:
     """Publish current only after output and its manifest are durable."""
     pending = promoted.model_copy(update={"promotion": PromotionIntent(phase="current_pending")})
@@ -359,7 +347,8 @@ def _finalize_current(layout: SnapshotLayout, promoted: SnapshotResult) -> Snaps
         write_manifest(layout.manifest, finalized)
     except Exception:
         return pending
-    _reject_symlink(layout.staging)
+    _prepare_staging(layout)
+    _validate_promoted_artifacts(layout, promoted)
     with suppress(OSError):
         rmtree(layout.staging)
     return finalized
@@ -368,12 +357,23 @@ def _finalize_current(layout: SnapshotLayout, promoted: SnapshotResult) -> Snaps
 def _finish_promotion(layout: SnapshotLayout, validated: SnapshotResult) -> SnapshotResult:
     """Move validated Silver and publish it, leaving interruptions recoverable."""
     try:
+        _prepare_staging(layout)
+        promotion_phase = validated.promotion.phase if validated.promotion is not None else ""
         if layout.promoted.exists():
-            _reject_symlink(layout.promoted)
+            if promotion_phase not in {"rename_pending", "silver_renamed", "current_pending"}:
+                raise FileExistsError("promoted target already exists for a new snapshot run")
+            _validate_promoted_artifacts(layout, validated)
         elif layout.silver.exists():
+            if promotion_phase == "validated":
+                rename_intent = validated.model_copy(
+                    update={"promotion": PromotionIntent(phase="rename_pending")}
+                )
+                write_manifest(layout.manifest, rename_intent)
+                validated = rename_intent
             _reject_symlink(layout.silver)
             layout.silver.replace(layout.promoted)
             fsync_directory(layout.promoted.parent)
+            _validate_promoted_artifacts(layout, validated)
         else:
             raise FileNotFoundError("validated Silver output is missing during promotion")
         pending = _promoted_snapshot(validated, layout)
@@ -420,15 +420,31 @@ def _recover_existing(
     layout: SnapshotLayout, existing: SnapshotResult, sources: Sequence[Path]
 ) -> SnapshotResult:
     """Reconcile durable publication state while holding its snapshot claim."""
+    if existing.status is RunStatus.RUNNING:
+        if existing.inputs and not _same_sources(existing, sources):
+            raise SnapshotConflict(
+                "snapshot_id is already associated with different source checksums"
+            )
+        interrupted = _failed_snapshot(
+            existing,
+            existing.tables,
+            existing.quality,
+            FailureEvidence(
+                phase="interrupted_running",
+                error_type="InterruptedRun",
+                message="a prior RUNNING manifest was recovered without an active owner",
+            ),
+        )
+        write_manifest(layout.manifest, interrupted)
+        return interrupted
     if not _same_sources(existing, sources):
         raise SnapshotConflict("snapshot_id is already associated with different source checksums")
     if existing.status is RunStatus.PROMOTED:
         if existing.promotion is not None or not layout.current_manifest.exists():
             return _finalize_current(layout, existing)
         return existing
-    if existing.status is RunStatus.VALIDATED and layout.promoted.exists():
-        _reject_symlink(layout.promoted)
-        return _finalize_current(layout, _promoted_snapshot(existing, layout))
+    if existing.status is RunStatus.VALIDATED:
+        return _finish_promotion(layout, existing)
     if existing.status is RunStatus.FAILED and existing.promotion is not None:
         return _finish_promotion(
             layout,
@@ -450,6 +466,8 @@ def ingest_snapshot(
     with _snapshot_claim(locks_root, snapshot_id):
         if layout.manifest.exists():
             return _recover_existing(layout, load_manifest(layout.manifest), source_paths)
+        candidates = _sources_by_table(source_paths)
+        inputs = [candidates[kind].source for kind in TableKind if kind in candidates]
 
         running = SnapshotResult(
             run_id=uuid4(),
@@ -461,15 +479,17 @@ def ingest_snapshot(
             quality=[],
             promoted_path=None,
             parser_version=settings.parser_version,
+            inputs=inputs,
+            promotion=PromotionIntent(phase="running"),
         )
         write_manifest(layout.manifest, running)
         tables: list[TableResult] = []
         quality: tuple[QualityResult, ...] = ()
         failure_error: Exception | None = None
+        staging_ready = False
         try:
-            _reject_symlink(layout.staging)
-            _ensure_real_directory(layout.staging)
-            candidates = _sources_by_table(source_paths)
+            _prepare_staging(layout)
+            staging_ready = True
             for kind in TableKind:
                 candidate = candidates.get(kind)
                 if candidate is not None:
@@ -504,7 +524,7 @@ def ingest_snapshot(
         except Exception as error:
             failure_error = error
             evidence = FailureEvidence(
-                phase="staging_setup" if not layout.staging.exists() else "pipeline",
+                phase="pipeline" if staging_ready else "staging_setup",
                 error_type=type(error).__name__,
                 message=str(error),
             )

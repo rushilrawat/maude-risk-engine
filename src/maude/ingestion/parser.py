@@ -11,7 +11,7 @@ from typing import TextIO
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
-from maude.domain.models import BronzeResult, ParseStats, SourceIdentity
+from maude.domain.models import BronzeResult, InspectedSource, ParseStats, SourceIdentity
 from maude.ingestion.archive import inspect_source, open_source_text
 from maude.ingestion.encoding import select_encoding
 from maude.ingestion.schemas import TableSpec, detect_table, normalize_column
@@ -85,6 +85,7 @@ def parse_to_bronze(
     reject_path: Path,
     batch_rows: int,
     parser_version: str = "1.0.0",
+    inspected: InspectedSource | None = None,
 ) -> BronzeResult:
     """Stream a pipe-delimited FDA source to Bronze Parquet and JSONL rejects."""
     if batch_rows < 1:
@@ -96,7 +97,10 @@ def parse_to_bronze(
     if target_path == reject_path:
         raise ValueError("target_path and reject_path must differ")
 
-    inspected = inspect_source(source_path)
+    if inspected is None:
+        inspected = inspect_source(source_path)
+    elif inspected.path != source_path:
+        raise ValueError("provided inspection does not match source_path")
     encoding = select_encoding(inspected.sample)
     source_filename = inspected.member or source_path.name
     parquet_temporary: Path | None = None

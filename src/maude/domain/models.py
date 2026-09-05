@@ -74,6 +74,7 @@ class SnapshotResult(ContractModel):
     quality: Sequence[QualityResult]
     promoted_path: str | None
     parser_version: str
+    inputs: Sequence[SourceIdentity] = ()
     failure: FailureEvidence | None = None
     promotion: PromotionIntent | None = None
 
