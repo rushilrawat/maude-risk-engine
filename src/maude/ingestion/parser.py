@@ -86,6 +86,7 @@ def parse_to_bronze(
     batch_rows: int,
     parser_version: str = "1.0.0",
     inspected: InspectedSource | None = None,
+    source_identity: SourceIdentity | None = None,
 ) -> BronzeResult:
     """Stream a pipe-delimited FDA source to Bronze Parquet and JSONL rejects."""
     if batch_rows < 1:
@@ -101,8 +102,22 @@ def parse_to_bronze(
         inspected = inspect_source(source_path)
     elif inspected.path != source_path:
         raise ValueError("provided inspection does not match source_path")
+    if source_identity is not None and (
+        source_identity.sha256 != inspected.sha256
+        or source_identity.byte_size != inspected.byte_size
+        or source_identity.archive_member != inspected.member
+    ):
+        raise ValueError("provided source identity does not match inspected bytes")
     encoding = select_encoding(inspected.sample)
-    source_filename = inspected.member or source_path.name
+    provenance_source = source_identity or SourceIdentity(
+        path=str(inspected.path),
+        filename=inspected.member or source_path.name,
+        sha256=inspected.sha256,
+        byte_size=inspected.byte_size,
+        archive_member=inspected.member,
+        encoding=encoding,
+    )
+    source_filename = provenance_source.filename
     parquet_temporary: Path | None = None
     rejects_temporary: Path | None = None
 
@@ -143,7 +158,7 @@ def parse_to_bronze(
                             expected_field_count=len(header),
                             actual_field_count=len(row),
                             row=row,
-                            source_snapshot_sha256=inspected.sha256,
+                            source_snapshot_sha256=provenance_source.sha256,
                             source_filename=source_filename,
                             parser_version=parser_version,
                         )
@@ -159,7 +174,7 @@ def parse_to_bronze(
                             expected_field_count=len(header),
                             actual_field_count=len(row),
                             row=row,
-                            source_snapshot_sha256=inspected.sha256,
+                            source_snapshot_sha256=provenance_source.sha256,
                             source_filename=source_filename,
                             parser_version=parser_version,
                         )
@@ -168,7 +183,7 @@ def parse_to_bronze(
                     accepted.update(
                         {
                             "_source_line_number": str(reader.line_num),
-                            "_source_snapshot_sha256": inspected.sha256,
+                            "_source_snapshot_sha256": provenance_source.sha256,
                             "_source_filename": source_filename,
                         }
                     )
@@ -192,14 +207,6 @@ def parse_to_bronze(
             rejects_temporary.unlink(missing_ok=True)
         raise
 
-    source = SourceIdentity(
-        path=str(inspected.path),
-        filename=source_filename,
-        sha256=inspected.sha256,
-        byte_size=inspected.byte_size,
-        archive_member=inspected.member,
-        encoding=encoding,
-    )
     stats = ParseStats(
         rows_seen=rows_seen,
         rows_accepted=rows_accepted,
@@ -208,7 +215,7 @@ def parse_to_bronze(
     )
     return BronzeResult(
         table=table.kind,
-        source=source,
+        source=provenance_source,
         bronze_path=str(target_path),
         reject_path=str(reject_path),
         stats=stats,

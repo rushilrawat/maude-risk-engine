@@ -28,6 +28,11 @@ class SnapshotLayout:
         return self.staging / "rejects"
 
     @property
+    def sources(self) -> Path:
+        """Private immutable copies of inputs bound to this staging attempt."""
+        return self.staging / "sources"
+
+    @property
     def manifest(self) -> Path:
         return self.data_root / "manifests" / f"{self.snapshot_id}.json"
 

@@ -1,9 +1,19 @@
-"""Snapshot ingestion orchestration with recoverable atomic Silver promotion."""
+"""Snapshot ingestion orchestration with recoverable atomic Silver promotion.
+
+The data root is a private, operator-controlled workspace: this pipeline does
+not attempt to defend PyArrow output path operations from an adversarial
+same-user process that can replace paths concurrently.  It still rejects
+pre-existing symlinks and invalid layout entries, and uses no-follow opening
+for the per-snapshot advisory claim to avoid lock redirection races.
+"""
 
 import fcntl
+import hashlib
 import json
 import os
 import re
+import stat
+import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -34,6 +44,8 @@ from maude.storage.layout import SnapshotLayout
 
 _SNAPSHOT_ID = re.compile(r"[a-zA-Z0-9._-]+\Z")
 _CLAIM_HOOK: Callable[[], None] | None = None
+_PRE_FLOCK_HOOK: Callable[[], None] | None = None
+_COPY_BLOCK_SIZE = 1024 * 1024
 
 
 class SnapshotConflict(ValueError):
@@ -44,15 +56,31 @@ class SnapshotConflict(ValueError):
 class _SourceCandidate:
     table: TableKind
     path: Path
+    staged_path: Path
     source: SourceIdentity
     inspected: InspectedSource
 
 
 class _StageFailure(Exception):
-    def __init__(self, error: Exception, evidence: FailureEvidence) -> None:
+    def __init__(
+        self,
+        error: Exception,
+        evidence: FailureEvidence,
+        inputs: Sequence[SourceIdentity] = (),
+    ) -> None:
         super().__init__(str(error))
         self.error = error
         self.evidence = evidence
+        self.inputs = tuple(inputs)
+
+
+class _SourceIdentificationFailure(Exception):
+    """Carry a completed source identity when family recognition fails."""
+
+    def __init__(self, error: Exception, source: SourceIdentity) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.source = source
 
 
 def _require_snapshot_id(snapshot_id: str) -> None:
@@ -112,18 +140,33 @@ def _snapshot_claim(locks_root: Path, snapshot_id: str) -> Iterator[None]:
     _reject_symlink(lock_path)
     if lock_path.exists() and lock_path.is_dir():
         raise ValueError(f"legacy directory claim must be removed safely: {lock_path}")
-    with lock_path.open("a+", encoding="utf-8", newline="\n") as owner:
-        fcntl.flock(owner.fileno(), fcntl.LOCK_EX)
-        owner.seek(0)
-        owner.truncate()
-        owner.write(json.dumps({"pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()}))
-        owner.flush()
-        os.fsync(owner.fileno())
-        fsync_directory(locks_root)
-        if _CLAIM_HOOK is not None:
-            _CLAIM_HOOK()
-        yield
-        fcntl.flock(owner.fileno(), fcntl.LOCK_UN)
+    flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"snapshot claim is not a regular file: {lock_path}")
+        if _PRE_FLOCK_HOOK is not None:
+            _PRE_FLOCK_HOOK()
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            with os.fdopen(
+                descriptor, "r+", encoding="utf-8", newline="\n", closefd=False
+            ) as owner:
+                owner.seek(0)
+                owner.truncate()
+                owner.write(
+                    json.dumps({"pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()})
+                )
+                owner.flush()
+                os.fsync(descriptor)
+            fsync_directory(locks_root)
+            if _CLAIM_HOOK is not None:
+                _CLAIM_HOOK()
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _source_checksums(sources: Sequence[Path]) -> tuple[str, ...]:
@@ -142,29 +185,92 @@ def _same_sources(snapshot: SnapshotResult, sources: Sequence[Path]) -> bool:
     return bool(expected) and _source_checksums(sources) == expected
 
 
-def _source_identity(path: Path) -> tuple[SourceIdentity, InspectedSource]:
-    inspected = inspect_source(path)
+def _source_identity(path: Path, inspected: InspectedSource) -> SourceIdentity:
     encoding = select_encoding(inspected.sample)
-    return (
-        SourceIdentity(
-            path=str(inspected.path),
-            filename=inspected.member or path.name,
-            sha256=inspected.sha256,
-            byte_size=inspected.byte_size,
-            archive_member=inspected.member,
-            encoding=encoding,
-        ),
-        inspected,
+    return SourceIdentity(
+        path=str(path),
+        filename=inspected.member or path.name,
+        sha256=inspected.sha256,
+        byte_size=inspected.byte_size,
+        archive_member=inspected.member,
+        encoding=encoding,
     )
 
 
-def _sources_by_table(sources: Sequence[Path]) -> dict[TableKind, _SourceCandidate]:
-    """Identify validated source families before parsing their headers."""
+def _prepare_source_staging(layout: SnapshotLayout) -> None:
+    """Prepare the private source-copy leaf before reading any FDA input."""
+    _ensure_real_directory(layout.staging)
+    _reject_symlink(layout.sources)
+    _require_descendant(layout.sources, layout.staging)
+    _ensure_real_directory(layout.sources)
+    _reject_symlink(layout.sources)
+
+
+def _stage_source(layout: SnapshotLayout, path: Path, index: int) -> _SourceCandidate:
+    """Copy one source in bounded blocks, sync it, and inspect only that copy."""
+    staged_path = layout.sources / f"{index:02d}-{path.name}"
+    _require_descendant(staged_path, layout.sources)
+    _reject_symlink(staged_path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{staged_path.name}.", suffix=".tmp", dir=staged_path.parent
+    )
+    temporary_path = Path(temporary_name)
+    digest = hashlib.sha256()
+    byte_size = 0
+    try:
+        with os.fdopen(descriptor, "wb") as staged_handle, path.open("rb") as source_handle:
+            for block in iter(lambda: source_handle.read(_COPY_BLOCK_SIZE), b""):
+                digest.update(block)
+                byte_size += len(block)
+                staged_handle.write(block)
+            staged_handle.flush()
+            os.fsync(staged_handle.fileno())
+        _reject_symlink(staged_path)
+        temporary_path.replace(staged_path)
+        fsync_directory(staged_path.parent)
+        inspected = inspect_source(staged_path)
+        if inspected.sha256 != digest.hexdigest() or inspected.byte_size != byte_size:
+            raise ValueError("staged source bytes do not match the copied source checksum")
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    source = _source_identity(path, inspected)
+    matches = tuple(
+        spec
+        for spec in TABLE_SPECS
+        if any(token in source.filename.lower() for token in spec.filename_tokens)
+    )
+    if len(matches) != 1:
+        error = SchemaMismatch(
+            f"filename {source.filename!r} does not match exactly one table family"
+        )
+        raise _SourceIdentificationFailure(error, source) from error
+    return _SourceCandidate(matches[0].kind, path, staged_path, source, inspected)
+
+
+def _sources_by_table(
+    layout: SnapshotLayout, sources: Sequence[Path]
+) -> dict[TableKind, _SourceCandidate]:
+    """Stage and identify each source before the durable RUNNING transition."""
     discovered: dict[TableKind, _SourceCandidate] = {}
-    for raw_path in sources:
+    collected: list[SourceIdentity] = []
+    for index, raw_path in enumerate(sources):
         path = Path(raw_path)
         try:
-            source, inspected = _source_identity(path)
+            candidate = _stage_source(layout, path, index)
+        except _SourceIdentificationFailure as failure:
+            error = failure.error
+            raise _StageFailure(
+                error,
+                FailureEvidence(
+                    phase="source_identification",
+                    source_path=str(path),
+                    source=failure.source,
+                    error_type=type(error).__name__,
+                    message=str(error),
+                ),
+                [*collected, failure.source],
+            ) from error
         except Exception as error:
             raise _StageFailure(
                 error,
@@ -174,30 +280,24 @@ def _sources_by_table(sources: Sequence[Path]) -> dict[TableKind, _SourceCandida
                     error_type=type(error).__name__,
                     message=str(error),
                 ),
+                collected,
             ) from error
-        matches = tuple(
-            spec
-            for spec in TABLE_SPECS
-            if any(token in source.filename.lower() for token in spec.filename_tokens)
-        )
-        if len(matches) != 1:
-            schema_error = SchemaMismatch(
-                f"filename {source.filename!r} does not match exactly one table family"
-            )
+        collected.append(candidate.source)
+        if candidate.table in discovered:
+            duplicate_error = ValueError(f"multiple sources detected for {candidate.table.value}")
             raise _StageFailure(
-                schema_error,
+                duplicate_error,
                 FailureEvidence(
                     phase="source_identification",
+                    table=candidate.table,
                     source_path=str(path),
-                    source=source,
-                    error_type=type(schema_error).__name__,
-                    message=str(schema_error),
+                    source=candidate.source,
+                    error_type=type(duplicate_error).__name__,
+                    message=str(duplicate_error),
                 ),
-            ) from schema_error
-        kind = matches[0].kind
-        if kind in discovered:
-            raise ValueError(f"multiple sources detected for {kind.value}")
-        discovered[kind] = _SourceCandidate(kind, path, source, inspected)
+                collected,
+            ) from duplicate_error
+        discovered[candidate.table] = candidate
     return discovered
 
 
@@ -238,12 +338,13 @@ def _process_table(
 ) -> TableResult:
     try:
         bronze = parse_to_bronze(
-            candidate.path,
+            candidate.staged_path,
             layout.bronze / f"{candidate.table.value}.parquet",
             layout.rejects / f"{candidate.table.value}.jsonl",
             settings.batch_rows,
             settings.parser_version,
             candidate.inspected,
+            candidate.source,
         )
         normalization = normalize_bronze(
             Path(bronze.bronze_path),
@@ -304,6 +405,29 @@ def _failed_snapshot(
     )
 
 
+def _failed_discovery_snapshot(
+    snapshot_id: str,
+    settings: Settings,
+    started_at: datetime,
+    inputs: Sequence[SourceIdentity],
+    evidence: FailureEvidence,
+) -> SnapshotResult:
+    """Record a source-stage failure before a full RUNNING manifest exists."""
+    return SnapshotResult(
+        run_id=uuid4(),
+        snapshot_id=snapshot_id,
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+        status=RunStatus.FAILED,
+        tables=[],
+        quality=[],
+        promoted_path=None,
+        parser_version=settings.parser_version,
+        inputs=list(inputs),
+        failure=evidence,
+    )
+
+
 def _promoted_snapshot(validated: SnapshotResult, layout: SnapshotLayout) -> SnapshotResult:
     return validated.model_copy(
         update={
@@ -336,6 +460,7 @@ def _validate_promoted_artifacts(layout: SnapshotLayout, snapshot: SnapshotResul
 
 def _finalize_current(layout: SnapshotLayout, promoted: SnapshotResult) -> SnapshotResult:
     """Publish current only after output and its manifest are durable."""
+    _validate_promoted_artifacts(layout, promoted)
     pending = promoted.model_copy(update={"promotion": PromotionIntent(phase="current_pending")})
     write_manifest(layout.manifest, pending)
     try:
@@ -347,9 +472,7 @@ def _finalize_current(layout: SnapshotLayout, promoted: SnapshotResult) -> Snaps
         write_manifest(layout.manifest, finalized)
     except Exception:
         return pending
-    _prepare_staging(layout)
-    _validate_promoted_artifacts(layout, promoted)
-    with suppress(OSError):
+    with suppress(Exception):
         rmtree(layout.staging)
     return finalized
 
@@ -378,6 +501,7 @@ def _finish_promotion(layout: SnapshotLayout, validated: SnapshotResult) -> Snap
             raise FileNotFoundError("validated Silver output is missing during promotion")
         pending = _promoted_snapshot(validated, layout)
         write_manifest(layout.manifest, pending)
+        return _finalize_current(layout, pending)
     except Exception as error:
         rollback_error: Exception | None = None
         if layout.promoted.exists() and not layout.silver.exists():
@@ -413,7 +537,6 @@ def _finish_promotion(layout: SnapshotLayout, validated: SnapshotResult) -> Snap
         )
         write_manifest(layout.manifest, failed)
         return failed
-    return _finalize_current(layout, pending)
 
 
 def _recover_existing(
@@ -466,13 +589,41 @@ def ingest_snapshot(
     with _snapshot_claim(locks_root, snapshot_id):
         if layout.manifest.exists():
             return _recover_existing(layout, load_manifest(layout.manifest), source_paths)
-        candidates = _sources_by_table(source_paths)
+        started_at = datetime.now(UTC)
+        try:
+            _prepare_source_staging(layout)
+            candidates = _sources_by_table(layout, source_paths)
+        except _StageFailure as failure:
+            failed = _failed_discovery_snapshot(
+                snapshot_id,
+                settings,
+                started_at,
+                failure.inputs,
+                failure.evidence,
+            )
+            try:
+                write_manifest(layout.manifest, failed)
+            except Exception:
+                raise failure.error from None
+            return failed
+        except Exception as error:
+            evidence = FailureEvidence(
+                phase="source_staging",
+                error_type=type(error).__name__,
+                message=str(error),
+            )
+            failed = _failed_discovery_snapshot(snapshot_id, settings, started_at, (), evidence)
+            try:
+                write_manifest(layout.manifest, failed)
+            except Exception:
+                raise error from None
+            return failed
         inputs = [candidates[kind].source for kind in TableKind if kind in candidates]
 
         running = SnapshotResult(
             run_id=uuid4(),
             snapshot_id=snapshot_id,
-            started_at=datetime.now(UTC),
+            started_at=started_at,
             finished_at=None,
             status=RunStatus.RUNNING,
             tables=[],

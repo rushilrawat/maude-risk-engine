@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pyarrow.parquet as pq
 import pytest
 
 import maude.ingestion.pipeline as pipeline
 from maude.config import Settings
 from maude.domain.enums import QualityLevel, RunStatus, TableKind
 from maude.domain.models import PromotionIntent, SnapshotResult
+from maude.ingestion.archive import sha256_file
 from maude.ingestion.manifests import load_manifest, write_manifest
 from maude.ingestion.pipeline import SnapshotConflict, ingest_snapshot
 from maude.storage.layout import SnapshotLayout
@@ -72,15 +75,29 @@ def _ingest_worker(
     results: object,
     claim_entered: object | None = None,
     claim_release: object | None = None,
+    pre_flock_attempted: object | None = None,
+    second_entered: object | None = None,
 ) -> None:
     ready.wait()  # type: ignore[union-attr]
-    if claim_entered is not None and claim_release is not None:
+    if (
+        claim_entered is not None
+        and claim_release is not None
+        and pre_flock_attempted is not None
+        and second_entered is not None
+    ):
+
+        def mark_pre_flock_attempt() -> None:
+            if claim_entered.is_set():  # type: ignore[union-attr]
+                pre_flock_attempted.set()  # type: ignore[union-attr]
 
         def hold_first_claim() -> None:
             if not claim_entered.is_set():  # type: ignore[union-attr]
                 claim_entered.set()  # type: ignore[union-attr]
                 assert claim_release.wait(timeout=10)  # type: ignore[union-attr]
+            else:
+                second_entered.set()  # type: ignore[union-attr]
 
+        pipeline._PRE_FLOCK_HOOK = mark_pre_flock_attempt
         pipeline._CLAIM_HOOK = hold_first_claim
     try:
         result = ingest_snapshot(
@@ -93,6 +110,7 @@ def _ingest_worker(
         results.put(("error", type(error).__name__))  # type: ignore[union-attr]
     finally:
         pipeline._CLAIM_HOOK = None
+        pipeline._PRE_FLOCK_HOOK = None
 
 
 def _run_contended_workers(
@@ -101,6 +119,8 @@ def _run_contended_workers(
     context = multiprocessing.get_context("spawn")
     entered = context.Event()
     release = context.Event()
+    pre_flock_attempted = context.Event()
+    second_entered = context.Event()
     ready = context.Event()
     ready.set()
     results = context.Queue()
@@ -116,6 +136,8 @@ def _run_contended_workers(
                 results,
                 entered,
                 release,
+                pre_flock_attempted,
+                second_entered,
             ),
         )
         for inputs in source_sets
@@ -126,6 +148,8 @@ def _run_contended_workers(
         workers[0].start()
         assert entered.wait(timeout=10)
         workers[1].start()
+        assert pre_flock_attempted.wait(timeout=10)
+        assert not second_entered.wait(timeout=0.25)
         release.set()
         for worker in workers:
             worker.join(timeout=20)
@@ -249,6 +273,147 @@ def test_cleanup_failure_does_not_rollback_an_already_published_pointer(
     assert load_manifest(layout.current_manifest).status is RunStatus.PROMOTED
 
 
+def test_original_source_mutation_after_discovery_cannot_change_processed_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    sources = _sources(tmp_path / "sources")
+    master = next(source for source in sources if source.name == "mdrfoi.zip")
+    original_checksum = sha256_file(master)
+    original_prepare = pipeline._prepare_staging
+
+    def mutate_original_after_discovery(layout: SnapshotLayout) -> None:
+        original_prepare(layout)
+        _write_zip(
+            master,
+            "mdrfoi.txt",
+            "MDR_REPORT_KEY|DATE_RECEIVED|EVENT_TYPE\n1|01/02/2025|D\n2|01/03/2025|E\n",
+        )
+
+    monkeypatch.setattr(pipeline, "_prepare_staging", mutate_original_after_discovery)
+    result = ingest_snapshot("fixture-2025-06", sources, settings)
+
+    table = next(table for table in result.tables if table.table is TableKind.MASTER)
+    rows = pq.read_table(table.silver_path).to_pylist()
+    assert table.source.path == str(master)
+    assert table.source.sha256 == original_checksum
+    assert sha256_file(master) != original_checksum
+    assert [row["event_type"] for row in rows] == ["D", "M"]
+    assert {row["_source_snapshot_sha256"] for row in rows} == {original_checksum}
+
+
+@pytest.mark.parametrize("broken_source", ("missing", "corrupt"))
+def test_source_discovery_failures_persist_minimal_manifest_and_retain_current(
+    tmp_path: Path, broken_source: str
+) -> None:
+    settings = _settings(tmp_path)
+    prior = ingest_snapshot("fixture-2025-05", _sources(tmp_path / "prior"), settings)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    source = tmp_path / "sources" / "mdrfoi.zip"
+    source.parent.mkdir()
+    if broken_source == "corrupt":
+        source.write_bytes(b"not a zip")
+
+    result = ingest_snapshot(layout.snapshot_id, (source,), settings)
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.phase == "source_inspection"
+    assert result.failure.source_path == str(source)
+    assert load_manifest(layout.manifest).model_dump() == result.model_dump()
+    assert load_manifest(layout.current_manifest).snapshot_id == prior.snapshot_id
+
+
+def test_duplicate_source_family_persists_discovery_failure_and_partial_inputs(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    prior = ingest_snapshot("fixture-2025-05", _sources(tmp_path / "prior"), settings)
+    sources = _sources(tmp_path / "sources")
+    master = next(source for source in sources if source.name == "mdrfoi.zip")
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+
+    result = ingest_snapshot(layout.snapshot_id, (*sources, master), settings)
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.phase == "source_identification"
+    assert result.failure.source_path == str(master)
+    assert len(result.inputs) == 5
+    assert load_manifest(layout.current_manifest).snapshot_id == prior.snapshot_id
+
+
+def test_unidentified_source_persists_its_discovered_input(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = _write_zip(
+        source_root / "unknown.zip",
+        "unknown.txt",
+        "MDR_REPORT_KEY|UNKNOWN\n1|value\n",
+    )
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+
+    result = ingest_snapshot(layout.snapshot_id, (source,), settings)
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.phase == "source_identification"
+    assert result.failure.source_path == str(source)
+    assert [item.path for item in result.inputs] == [str(source)]
+
+
+@pytest.mark.parametrize("helper_name", ("_prepare_staging", "_validate_promoted_artifacts"))
+def test_post_pointer_safety_errors_cannot_downgrade_promoted_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, helper_name: str
+) -> None:
+    settings = _settings(tmp_path)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    pointer_published = False
+    original_write = pipeline.write_manifest
+    original_helper = getattr(pipeline, helper_name)
+
+    def mark_pointer(path: Path, snapshot: SnapshotResult) -> None:
+        nonlocal pointer_published
+        original_write(path, snapshot)
+        if path == layout.current_manifest:
+            pointer_published = True
+
+    def fail_only_after_pointer(*args: object) -> object:
+        if pointer_published:
+            raise OSError(f"simulated post-pointer {helper_name} failure")
+        return original_helper(*args)
+
+    monkeypatch.setattr(pipeline, "write_manifest", mark_pointer)
+    monkeypatch.setattr(pipeline, helper_name, fail_only_after_pointer)
+    result = ingest_snapshot(layout.snapshot_id, _sources(tmp_path / "sources"), settings)
+
+    assert result.status is RunStatus.PROMOTED
+    assert load_manifest(layout.manifest).status is RunStatus.PROMOTED
+    assert load_manifest(layout.current_manifest).status is RunStatus.PROMOTED
+
+
+def test_snapshot_claim_open_uses_no_follow_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
+    lock_path = settings.data_root / "locks" / f"{layout.snapshot_id}.lock"
+    observed_flags: list[int] = []
+    original_open = pipeline.os.open
+
+    def observe_open(path: Path | str, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+        if Path(path) == lock_path:
+            observed_flags.append(flags)
+        return original_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(pipeline.os, "open", observe_open)
+    result = ingest_snapshot(layout.snapshot_id, _sources(tmp_path / "sources"), settings)
+
+    assert result.status is RunStatus.PROMOTED
+    assert observed_flags and observed_flags[0] & os.O_NOFOLLOW
+
+
 @pytest.mark.parametrize(
     "snapshot_id", (".", "..", "../escape", "contains space", "slash/name", "")
 )
@@ -335,7 +500,7 @@ def test_staging_setup_failure_persists_failed_manifest(
 
     assert result.status is RunStatus.FAILED
     assert result.failure is not None
-    assert result.failure.phase == "staging_setup"
+    assert result.failure.phase == "source_staging"
     assert load_manifest(layout.manifest).status is RunStatus.FAILED
 
 
@@ -530,7 +695,8 @@ def test_interrupted_running_with_same_inputs_becomes_durable_failure(tmp_path: 
     settings = _settings(tmp_path)
     sources = _sources(tmp_path / "sources")
     layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
-    candidates = pipeline._sources_by_table(sources)
+    pipeline._prepare_source_staging(layout)
+    candidates = pipeline._sources_by_table(layout, sources)
     running = SnapshotResult(
         run_id=uuid4(),
         snapshot_id=layout.snapshot_id,
@@ -558,7 +724,8 @@ def test_interrupted_running_with_different_inputs_is_a_conflict(tmp_path: Path)
     settings = _settings(tmp_path)
     sources = _sources(tmp_path / "sources")
     layout = SnapshotLayout(settings.data_root, "fixture-2025-06")
-    candidates = pipeline._sources_by_table(sources)
+    pipeline._prepare_source_staging(layout)
+    candidates = pipeline._sources_by_table(layout, sources)
     running = SnapshotResult(
         run_id=uuid4(),
         snapshot_id=layout.snapshot_id,
