@@ -5,6 +5,7 @@ only pre-aggregates device metadata; narratives are fetched as individual
 evidence rows so their identity and source location cannot be lost in a join.
 """
 
+import tempfile
 from collections.abc import Iterable
 from datetime import date, datetime
 from pathlib import Path
@@ -62,6 +63,7 @@ _MANUFACTURER_COLUMNS = (
     "manufacturer_g1_name",
     "manufacturer_g2_name",
 )
+_VALIDATION_MEMORY_LIMIT = "64MB"
 
 
 def _sql_literal(value: str | Path) -> str:
@@ -191,36 +193,66 @@ def _create_views(connection: duckdb.DuckDBPyConnection, artifacts: dict[str, Pa
 def _validate_snapshot_provenance(
     connection: duckdb.DuckDBPyConnection, artifacts: dict[str, Path]
 ) -> None:
-    """Require one non-null snapshot ID consistently across all source tables."""
+    """Require one non-blank snapshot ID consistently across non-empty tables.
+
+    Each query returns at most one row.  In particular, this deliberately avoids
+    ``COUNT(DISTINCT ...)`` so a malformed file with one ID per row cannot grow
+    Python or DuckDB state in proportion to its number of distinct IDs.
+    """
     expected_snapshot_id: str | None = None
     for view_name, path in artifacts.items():
-        row = connection.execute(
+        first_row = connection.execute(
+            f"SELECT CAST(dataset_snapshot_id AS VARCHAR) FROM {view_name} LIMIT 1"
+        ).fetchone()
+        if first_row is None:
+            continue
+
+        candidate_row = connection.execute(
             f"""
-            SELECT COUNT(*)::BIGINT,
-                   COUNT(dataset_snapshot_id)::BIGINT,
-                   COUNT(DISTINCT CAST(dataset_snapshot_id AS VARCHAR))::BIGINT,
-                   MIN(CAST(dataset_snapshot_id AS VARCHAR)),
-                   MAX(CAST(dataset_snapshot_id AS VARCHAR))
+            SELECT CAST(dataset_snapshot_id AS VARCHAR)
             FROM {view_name}
+            WHERE dataset_snapshot_id IS NOT NULL
+              AND trim(CAST(dataset_snapshot_id AS VARCHAR)) <> ''
+            LIMIT 1
             """
         ).fetchone()
-        if row is None:
+        if candidate_row is None:
             raise SnapshotSchemaError(
-                f"{view_name} artifact {path} did not return a provenance summary"
+                f"{view_name} artifact {path} contains no usable dataset_snapshot_id; "
+                f"first value is {first_row[0]!r}, but every row must be non-null and non-blank"
             )
-        total_rows, non_null_rows, distinct_ids, minimum_id, maximum_id = row
-        if total_rows == 0 or non_null_rows != total_rows:
+        snapshot_id = str(candidate_row[0])
+        invalid_row = connection.execute(
+            f"""
+            SELECT CAST(dataset_snapshot_id AS VARCHAR)
+            FROM {view_name}
+            WHERE dataset_snapshot_id IS NULL
+               OR trim(CAST(dataset_snapshot_id AS VARCHAR)) = ''
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid_row is not None:
             raise SnapshotSchemaError(
-                f"{view_name} artifact {path} must contain a non-null "
-                f"dataset_snapshot_id for every row; found "
-                f"{total_rows - non_null_rows} null value(s)"
+                f"{view_name} artifact {path} contains invalid dataset_snapshot_id "
+                f"value {invalid_row[0]!r}; every row must be non-null and non-blank"
             )
-        if distinct_ids != 1:
+
+        different_row = connection.execute(
+            f"""
+            SELECT CAST(dataset_snapshot_id AS VARCHAR)
+            FROM {view_name}
+            WHERE dataset_snapshot_id IS NOT NULL
+              AND trim(CAST(dataset_snapshot_id AS VARCHAR)) <> ''
+              AND CAST(dataset_snapshot_id AS VARCHAR) <> ?
+            LIMIT 1
+            """,
+            [snapshot_id],
+        ).fetchone()
+        if different_row is not None:
             raise SnapshotSchemaError(
-                f"{view_name} artifact {path} contains multiple dataset_snapshot_id values: "
-                f"{minimum_id!r} and {maximum_id!r}"
+                f"{view_name} artifact {path} contains multiple dataset_snapshot_id values; "
+                f"found {different_row[0]!r} and {snapshot_id!r}"
             )
-        snapshot_id = str(minimum_id)
         if expected_snapshot_id is None:
             expected_snapshot_id = snapshot_id
         elif snapshot_id != expected_snapshot_id:
@@ -262,9 +294,16 @@ def open_snapshot(snapshot_path: Path) -> duckdb.DuckDBPyConnection:
         for view_name, artifact in artifacts.items():
             _schema_columns(artifact, view_name)
         connection = duckdb.connect(":memory:")
-        _create_views(connection, artifacts)
-        _validate_snapshot_provenance(connection, artifacts)
-        _validate_report_keys(connection, artifacts["reports"])
+        with tempfile.TemporaryDirectory(prefix="maude-duckdb-validation-") as spill_directory:
+            connection.execute("SET memory_limit = ?", [_VALIDATION_MEMORY_LIMIT])
+            connection.execute("SET temp_directory = ?", [spill_directory])
+            _create_views(connection, artifacts)
+            _validate_snapshot_provenance(connection, artifacts)
+            _validate_report_keys(connection, artifacts["reports"])
+            # The spill directory is only needed for validation.  Resetting the
+            # setting before TemporaryDirectory cleanup keeps the returned
+            # caller-owned connection usable after this function returns.
+            connection.execute("SET temp_directory = ?", [""])
         return connection
     except BaseException:
         if connection is not None:
