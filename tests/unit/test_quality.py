@@ -3,6 +3,10 @@ from pathlib import Path
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+import maude.quality.checks as checks
 from maude.domain.enums import QualityLevel, RunStatus, TableKind
 from maude.domain.models import (
     ParseStats,
@@ -141,3 +145,63 @@ def test_quality_markdown_is_deterministic_and_contains_promotion_details() -> N
     assert "blocking-check" in rendered
     assert "Promotion outcome" in rendered
     assert rendered.index("blocking-check") < rendered.index("warning-check")
+
+
+def test_quality_markdown_preserves_identical_table_results_and_table_order() -> None:
+    table_quality = QualityResult(
+        check="same-check",
+        level=QualityLevel.WARNING,
+        passed=False,
+        message="same warning",
+        metrics={"numerator": 1, "denominator": 100, "threshold": 0.01, "observed": 0.01},
+    )
+    master = _table(TableKind.MASTER)
+    patient = _table(TableKind.PATIENT)
+    master = master.model_copy(update={"quality": (table_quality,)})
+    patient = patient.model_copy(update={"quality": (table_quality,)})
+    base = dict(
+        run_id=uuid4(),
+        snapshot_id="snapshot-context",
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        finished_at=None,
+        status=RunStatus.VALIDATED,
+        quality=(),
+        promoted_path=None,
+        parser_version="1.0.0",
+    )
+    first = SnapshotResult(tables=(master, patient), **base)
+    second = SnapshotResult(tables=(patient, master), **base)
+    first_report = render_quality_markdown(first)
+    assert first_report == render_quality_markdown(second)
+    assert first_report.count("same-check") == 2
+    assert "table:master source:master.txt" in first_report
+    assert "table:patient source:patient.txt" in first_report
+
+
+def test_parquet_rows_closes_reader_when_generator_is_closed(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "keys.parquet"
+    pq.write_table(pa.table({"key": ["one", "two"]}), path)
+    original = pq.ParquetFile
+    readers = []
+
+    class SpyReader:
+        def __init__(self, source: Path) -> None:
+            self.inner = original(source)
+            self.closed = False
+            readers.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.closed = True
+            self.inner.close()
+
+        def iter_batches(self, **kwargs: object):
+            return self.inner.iter_batches(**kwargs)
+
+    monkeypatch.setattr(checks.pq, "ParquetFile", SpyReader)
+    rows = checks._parquet_rows(path, ("key",))
+    next(rows)
+    rows.close()
+    assert readers[0].closed is True

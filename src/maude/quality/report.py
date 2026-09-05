@@ -6,24 +6,22 @@ from maude.domain.enums import QualityLevel
 from maude.domain.models import QualityResult, SnapshotResult
 
 
-def _checks(snapshot: SnapshotResult) -> tuple[QualityResult, ...]:
-    checks = list(snapshot.quality)
-    for table in snapshot.tables:
-        checks.extend(table.quality)
-    unique: dict[tuple[object, ...], QualityResult] = {}
-    for check in checks:
-        key = (
-            check.check,
-            check.level,
-            check.passed,
-            check.message,
-            json.dumps(dict(check.metrics), sort_keys=True),
-        )
-        unique[key] = check
+def _checks(snapshot: SnapshotResult) -> tuple[tuple[str, QualityResult], ...]:
+    checks: list[tuple[str, QualityResult]] = [("snapshot", result) for result in snapshot.quality]
+    for table in sorted(snapshot.tables, key=lambda value: value.table.value):
+        context = f"table:{table.table.value} source:{table.source.filename}"
+        checks.extend((context, result) for result in table.quality)
     return tuple(
         sorted(
-            unique.values(),
-            key=lambda result: (0 if result.level is QualityLevel.BLOCKING else 1, result.check),
+            checks,
+            key=lambda item: (
+                0 if item[1].level is QualityLevel.BLOCKING else 1,
+                item[1].check,
+                item[0],
+                json.dumps(dict(sorted(item[1].metrics.items())), sort_keys=True),
+                item[1].message,
+                item[1].passed,
+            ),
         )
     )
 
@@ -57,17 +55,18 @@ def render_quality_markdown(snapshot: SnapshotResult) -> str:
             "",
             "## Quality checks",
             "",
-            "| Check | Level | Passed | Message | Metrics |",
-            "|---|---|---:|---|---|",
+            "| Context | Check | Level | Passed | Message | Metrics |",
+            "|---|---|---:|---:|---|---|",
         ]
     )
-    for result in _checks(snapshot):
+    for context, result in _checks(snapshot):
         lines.append(
-            f"| {result.check} | {result.level.value} | {str(result.passed).lower()} | "
+            f"| {context} | {result.check} | {result.level.value} | {str(result.passed).lower()} | "
             f"{result.message} | `{_metrics(result)}` |"
         )
     blocking_failure = any(
-        result.level is QualityLevel.BLOCKING and not result.passed for result in _checks(snapshot)
+        result.level is QualityLevel.BLOCKING and not result.passed
+        for _, result in _checks(snapshot)
     )
     outcome = (
         "not promoted (blocking quality failure)"

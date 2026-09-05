@@ -5,10 +5,15 @@ open a configured database or discover an alternate source behind the caller's
 back.  File-based checks stream their inputs in small chunks.
 """
 
-from collections.abc import Iterable, Sequence
+import json
+import tempfile
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from zipfile import ZipFile
 
+import duckdb
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from maude.domain.enums import QualityLevel, TableKind
@@ -114,17 +119,42 @@ def _key_tuple(key: Key) -> tuple[str, ...]:
     return (key,) if isinstance(key, str) else tuple(key)
 
 
+def _sql_literal(value: str | Path) -> str:
+    """Quote a path for DuckDB SQL without treating it as executable SQL."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+@contextmanager
+def _quality_connection() -> Iterator[Any]:
+    """Open a temporary, spill-capable DuckDB connection and always close it."""
+    with tempfile.TemporaryDirectory(prefix="maude-quality-") as temporary_directory:
+        connection = duckdb.connect()
+        try:
+            connection.execute(f"SET temp_directory = {_sql_literal(temporary_directory)}")
+            yield connection
+        finally:
+            connection.close()
+
+
+def _counts_for_key_table(connection: Any, keys: Iterable[Key], table_name: str) -> tuple[int, int]:
+    connection.execute(f"CREATE TEMP TABLE {table_name} (key_json VARCHAR)")
+    for key in keys:
+        connection.execute(
+            f"INSERT INTO {table_name} VALUES (?)",
+            [json.dumps(list(_key_tuple(key)), ensure_ascii=False, separators=(",", ":"))],
+        )
+    row = connection.execute(
+        f"SELECT COUNT(*)::BIGINT, COUNT(DISTINCT key_json)::BIGINT FROM {table_name}"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("DuckDB did not return key counts")
+    return int(row[0]), int(row[0] - row[1])
+
+
 def business_key_uniqueness(keys: Iterable[Key]) -> QualityResult:
     """Block duplicate canonical business keys."""
-    seen: set[tuple[str, ...]] = set()
-    duplicates = 0
-    total = 0
-    for key in keys:
-        total += 1
-        canonical = _key_tuple(key)
-        if canonical in seen:
-            duplicates += 1
-        seen.add(canonical)
+    with _quality_connection() as connection:
+        total, duplicates = _counts_for_key_table(connection, keys, "quality_keys")
     observed = duplicates / total if total else 0.0
     return _result(
         "business_key_uniqueness",
@@ -168,15 +198,26 @@ def required_table_set(tables: Iterable[TableKind | TableResult | str]) -> Quali
 
 def orphan_fraction(child_keys: Iterable[str], master_keys: Iterable[str]) -> QualityResult:
     """Check child report keys against the explicitly supplied master key set."""
-    masters = set(master_keys)
-    total = 0
-    orphans = 0
-    for key in child_keys:
-        if not key:
-            continue
-        total += 1
-        if key not in masters:
-            orphans += 1
+    with _quality_connection() as connection:
+        connection.execute("CREATE TEMP TABLE quality_master (key VARCHAR)")
+        for key in master_keys:
+            connection.execute("INSERT INTO quality_master VALUES (?)", [key])
+        connection.execute("CREATE TEMP TABLE quality_child (key VARCHAR)")
+        for key in child_keys:
+            if key:
+                connection.execute("INSERT INTO quality_child VALUES (?)", [key])
+        row = connection.execute(
+            """
+            SELECT COUNT(*)::BIGINT,
+                   COALESCE(SUM(CASE WHEN master.key IS NULL THEN 1 ELSE 0 END), 0)::BIGINT
+            FROM quality_child AS child
+            LEFT JOIN (SELECT DISTINCT key FROM quality_master) AS master
+              ON child.key = master.key
+            """
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("DuckDB did not return orphan counts")
+        total, orphans = int(row[0]), int(row[1])
     observed = orphans / total if total else 0.0
     if orphans == 0:
         level, passed, message = QualityLevel.WARNING, True, "no orphan child keys found"
@@ -247,20 +288,92 @@ def truncation_comparison(
 
 
 def _parquet_rows(path: Path, columns: Sequence[str]) -> Iterable[tuple[str, ...]]:
-    parquet = pq.ParquetFile(path)
-    for batch in parquet.iter_batches(batch_size=8192, columns=list(columns)):
-        arrays = [batch.column(index).to_pylist() for index in range(batch.num_columns)]
-        for row in zip(*arrays, strict=True):
-            yield tuple("" if value is None else str(value) for value in row)
+    with pq.ParquetFile(path) as parquet:
+        for batch in parquet.iter_batches(batch_size=8192, columns=list(columns)):
+            arrays = [batch.column(index).to_pylist() for index in range(batch.num_columns)]
+            for row in zip(*arrays, strict=True):
+                yield tuple("" if value is None else str(value) for value in row)
 
 
-def _table_keys(table: TableResult) -> Iterable[tuple[str, ...]]:
-    path = Path(table.silver_path)
-    if not path.exists():
-        return ()
-    spec = spec_for(table.table)
-    columns = tuple(normalize_column(column) for column in spec.business_key)
-    return _parquet_rows(path, columns)
+def _parquet_uniqueness(connection: Any, path: Path, columns: Sequence[str]) -> QualityResult:
+    expressions = [
+        f"coalesce(CAST({_sql_identifier(column)} AS VARCHAR), '<NULL>')" for column in columns
+    ]
+    distinct_expression = expressions[0] if len(expressions) == 1 else f"({', '.join(expressions)})"
+    row = connection.execute(
+        f"SELECT COUNT(*)::BIGINT, COUNT(DISTINCT {distinct_expression})::BIGINT "
+        f"FROM read_parquet({_sql_literal(path)})"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("DuckDB did not return Parquet key counts")
+    total, unique = int(row[0]), int(row[1])
+    duplicates = total - unique
+    observed = duplicates / total if total else 0.0
+    return _result(
+        "business_key_uniqueness",
+        QualityLevel.BLOCKING,
+        duplicates == 0,
+        "canonical business keys are unique"
+        if duplicates == 0
+        else f"found {duplicates} duplicate canonical business key rows",
+        numerator=duplicates,
+        denominator=total,
+        threshold=0,
+        observed=observed,
+    )
+
+
+def _sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _parquet_orphans(
+    connection: Any, child_path: Path, master_path: Path, child_column: str = "mdr_report_key"
+) -> QualityResult:
+    child_key = _sql_identifier(child_column)
+    row = connection.execute(
+        f"""
+        WITH master AS (
+            SELECT DISTINCT CAST({_sql_identifier("mdr_report_key")} AS VARCHAR) AS key
+            FROM read_parquet({_sql_literal(master_path)})
+        ), child AS (
+            SELECT CAST({child_key} AS VARCHAR) AS key
+            FROM read_parquet({_sql_literal(child_path)})
+            WHERE {child_key} IS NOT NULL AND CAST({child_key} AS VARCHAR) <> ''
+        )
+        SELECT COUNT(*)::BIGINT,
+               COALESCE(SUM(CASE WHEN master.key IS NULL THEN 1 ELSE 0 END), 0)::BIGINT
+        FROM child LEFT JOIN master ON child.key = master.key
+        """
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("DuckDB did not return Parquet orphan counts")
+    total, orphans = int(row[0]), int(row[1])
+    observed = orphans / total if total else 0.0
+    if orphans == 0:
+        level, passed, message = QualityLevel.WARNING, True, "no orphan child keys found"
+    elif observed <= 0.01:
+        level, passed, message = (
+            QualityLevel.WARNING,
+            False,
+            "child table contains orphan report keys",
+        )
+    else:
+        level, passed, message = (
+            QualityLevel.BLOCKING,
+            False,
+            "orphan report-key fraction exceeds 1 percent",
+        )
+    return _result(
+        "orphan_fraction",
+        level,
+        passed,
+        message,
+        numerator=orphans,
+        denominator=total,
+        threshold=0.01,
+        observed=observed,
+    )
 
 
 def run_quality_checks(
@@ -269,38 +382,42 @@ def run_quality_checks(
     """Run the snapshot quality gates using only the supplied table results."""
     ordered = tuple(sorted(tables, key=lambda table: table.table.value))
     results: list[QualityResult] = [required_table_set(ordered)]
-    for table in ordered:
-        results.append(
-            row_conservation(
-                table.stats.rows_seen, table.stats.rows_accepted, table.stats.rows_rejected
-            )
-        )
-        results.append(reject_fraction(table.stats.rows_seen, table.stats.rows_rejected))
-        keys = _table_keys(table)
-        results.append(business_key_uniqueness(keys))
-        if previous is not None:
-            matching = next(
-                (
-                    prior
-                    for prior in previous.tables
-                    if prior.table is table.table and prior.source.filename == table.source.filename
-                ),
-                None,
-            )
-            if matching is not None:
-                results.append(
-                    row_count_drift(table.stats.rows_accepted, matching.stats.rows_accepted)
-                )
-
-    master = next((table for table in ordered if table.table is TableKind.MASTER), None)
-    if master is not None and Path(master.silver_path).exists():
-        master_keys = (key[0] for key in _table_keys(master))
-        master_key_set = set(master_keys)
+    with _quality_connection() as connection:
         for table in ordered:
-            if table.table is TableKind.MASTER or not Path(table.silver_path).exists():
-                continue
-            child_keys = (
-                key[0] for key in _parquet_rows(Path(table.silver_path), ("mdr_report_key",))
+            results.append(
+                row_conservation(
+                    table.stats.rows_seen, table.stats.rows_accepted, table.stats.rows_rejected
+                )
             )
-            results.append(orphan_fraction(child_keys, master_key_set))
+            results.append(reject_fraction(table.stats.rows_seen, table.stats.rows_rejected))
+            path = Path(table.silver_path)
+            if path.exists():
+                spec = spec_for(table.table)
+                columns = tuple(normalize_column(column) for column in spec.business_key)
+                results.append(_parquet_uniqueness(connection, path, columns))
+            else:
+                results.append(business_key_uniqueness(()))
+            if previous is not None:
+                matching = next(
+                    (
+                        prior
+                        for prior in previous.tables
+                        if prior.table is table.table
+                        and prior.source.filename == table.source.filename
+                    ),
+                    None,
+                )
+                if matching is not None:
+                    results.append(
+                        row_count_drift(table.stats.rows_accepted, matching.stats.rows_accepted)
+                    )
+
+        master = next((table for table in ordered if table.table is TableKind.MASTER), None)
+        if master is not None and Path(master.silver_path).exists():
+            master_path = Path(master.silver_path)
+            for table in ordered:
+                child_path = Path(table.silver_path)
+                if table.table is TableKind.MASTER or not child_path.exists():
+                    continue
+                results.append(_parquet_orphans(connection, child_path, master_path))
     return tuple(results)
