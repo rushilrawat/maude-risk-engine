@@ -38,17 +38,27 @@ def test_parser_streams_valid_rows_and_records_bad_field_count(tmp_path: Path) -
     assert '"reason":"field_count"' in (tmp_path / "rejects.jsonl").read_text()
 
 
+def test_parser_accepts_a_maude_narrative_larger_than_the_csv_default_limit(tmp_path: Path) -> None:
+    source = tmp_path / "foitext.txt"
+    source.write_text(
+        f"MDR_REPORT_KEY|MDR_TEXT_KEY|TEXT_TYPE_CODE|FOI_TEXT\n1|10|N|{'x' * 131_073}\n",
+        encoding="utf-8",
+    )
+
+    result = parse_to_bronze(
+        source, tmp_path / "bronze.parquet", tmp_path / "rejects.jsonl", batch_rows=1
+    )
+
+    assert result.stats.rows_accepted == 1
+    assert pq.read_table(result.bronze_path).column("FOI_TEXT")[0].as_py() == "x" * 131_073
+
+
 def test_parser_writes_only_bounded_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "patient.txt"
     source.write_text(
-        "MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER\n"
-        "1|1\n"
-        "2|2\n"
-        "3|3\n"
-        "4|4\n"
-        "5|5\n",
+        "MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER\n1|1\n2|2\n3|3\n4|4\n5|5\n",
         encoding="utf-8",
     )
     batch_lengths: list[int] = []
@@ -68,9 +78,7 @@ def test_parser_writes_only_bounded_batches(
 def test_parser_rejects_blank_business_key_fields(tmp_path: Path) -> None:
     source = tmp_path / "patient.txt"
     source.write_text(
-        "MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER\n"
-        "|1\n"
-        "2|\n",
+        "MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER\n|1\n2|\n",
         encoding="utf-8",
     )
 
@@ -91,8 +99,7 @@ def test_parser_rejects_blank_business_key_fields(tmp_path: Path) -> None:
 def test_parser_checks_business_keys_against_normalized_original_headers(tmp_path: Path) -> None:
     source = tmp_path / "patient.txt"
     source.write_text(
-        "MDR REPORT KEY|PATIENT SEQUENCE NUMBER\n"
-        "|1\n",
+        "MDR REPORT KEY|PATIENT SEQUENCE NUMBER\n|1\n",
         encoding="utf-8",
     )
 
@@ -104,9 +111,9 @@ def test_parser_checks_business_keys_against_normalized_original_headers(tmp_pat
     )
 
     assert result.stats.rows_rejected == 1
-    assert '"reason":"missing_business_key"' in (
-        tmp_path / "rejects.jsonl"
-    ).read_text(encoding="utf-8")
+    assert '"reason":"missing_business_key"' in (tmp_path / "rejects.jsonl").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_parser_uses_the_configured_version_for_accepted_and_rejected_provenance(

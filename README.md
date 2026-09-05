@@ -15,3 +15,11 @@ Run the full verification suite with:
 ```bash
 make verify
 ```
+
+## First vertical slice
+
+The first vertical slice audits canonical local FDA MAUDE archives, streams
+them into versioned Parquet, applies blocking quality gates, and exposes
+provenance-safe report documents. Follow the [local ingestion runbook](docs/runbooks/local-ingestion.md)
+for the read-only audit, archive-only override, output locations, and recovery
+workflow.

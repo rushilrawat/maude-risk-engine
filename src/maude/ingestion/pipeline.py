@@ -33,8 +33,7 @@ from maude.domain.models import (
     SourceIdentity,
     TableResult,
 )
-from maude.ingestion.archive import inspect_source, sha256_file
-from maude.ingestion.encoding import select_encoding
+from maude.ingestion.archive import inspect_source, select_source_encoding, sha256_file
 from maude.ingestion.manifests import fsync_directory, load_manifest, write_manifest
 from maude.ingestion.normalize import normalize_bronze
 from maude.ingestion.parser import parse_to_bronze
@@ -186,7 +185,7 @@ def _same_sources(snapshot: SnapshotResult, sources: Sequence[Path]) -> bool:
 
 
 def _source_identity(path: Path, inspected: InspectedSource) -> SourceIdentity:
-    encoding = select_encoding(inspected.sample)
+    encoding = select_source_encoding(path, inspected)
     return SourceIdentity(
         path=str(path),
         filename=inspected.member or path.name,

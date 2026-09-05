@@ -1,15 +1,16 @@
 """Safe inspection and streaming access for local FDA source files."""
 
+import codecs
 import hashlib
 import io
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import TextIO
+from typing import IO, TextIO
 from zipfile import BadZipFile, ZipFile, is_zipfile
 
 from maude.domain.models import InspectedSource
-from maude.ingestion.encoding import select_encoding
+from maude.ingestion.encoding import EncodingError, select_encoding
 
 SAMPLE_SIZE = 64 * 1024
 HASH_BLOCK_SIZE = 1024 * 1024
@@ -76,6 +77,40 @@ def inspect_source(path: Path) -> InspectedSource:
 
 
 @contextmanager
+def _open_source_bytes(path: Path, inspected: InspectedSource) -> Iterator[IO[bytes]]:
+    if inspected.member is None:
+        with path.open("rb") as source:
+            yield source
+        return
+    with ZipFile(path) as archive, archive.open(inspected.member, "r") as source:
+        yield source
+
+
+def _stream_decodes(path: Path, inspected: InspectedSource, encoding: str) -> bool:
+    try:
+        with _open_source_bytes(path, inspected) as source:
+            decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+            for block in iter(lambda: source.read(HASH_BLOCK_SIZE), b""):
+                decoder.decode(block)
+            decoder.decode(b"", final=True)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def select_source_encoding(path: Path, inspected: InspectedSource | None = None) -> str:
+    """Validate source encoding over its bounded byte stream, not only its sample."""
+    path = Path(path)
+    inspected = inspect_source(path) if inspected is None else inspected
+    candidate = select_encoding(inspected.sample)
+    if _stream_decodes(path, inspected, candidate):
+        return candidate
+    if candidate == "utf-8" and _stream_decodes(path, inspected, "cp1252"):
+        return "cp1252"
+    raise EncodingError("no supported encoding decodes the complete source stream")
+
+
+@contextmanager
 def open_source_text(
     path: Path,
     member: str | None = None,
@@ -96,7 +131,7 @@ def open_source_text(
         )
 
     if encoding is None:
-        encoding = select_encoding(inspected.sample)
+        encoding = select_source_encoding(path, inspected)
     if selected is None:
         with (
             Path(path).open("rb") as raw_file,

@@ -12,8 +12,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from maude.domain.models import BronzeResult, InspectedSource, ParseStats, SourceIdentity
-from maude.ingestion.archive import inspect_source, open_source_text
-from maude.ingestion.encoding import select_encoding
+from maude.ingestion.archive import inspect_source, open_source_text, select_source_encoding
 from maude.ingestion.schemas import TableSpec, detect_table, normalize_column
 
 PROVENANCE_COLUMNS = (
@@ -21,6 +20,7 @@ PROVENANCE_COLUMNS = (
     "_source_snapshot_sha256",
     "_source_filename",
 )
+MAX_FIELD_SIZE = 16 * 1024 * 1024
 
 
 def _temporary_sibling(path: Path) -> Path:
@@ -108,7 +108,11 @@ def parse_to_bronze(
         or source_identity.archive_member != inspected.member
     ):
         raise ValueError("provided source identity does not match inspected bytes")
-    encoding = select_encoding(inspected.sample)
+    encoding = (
+        source_identity.encoding
+        if source_identity is not None
+        else select_source_encoding(source_path, inspected)
+    )
     provenance_source = source_identity or SourceIdentity(
         path=str(inspected.path),
         filename=inspected.member or source_path.name,
@@ -128,73 +132,77 @@ def parse_to_bronze(
             inspected=inspected,
             encoding=encoding,
         ) as source_handle:
-            reader = csv.reader(source_handle, delimiter="|", quoting=csv.QUOTE_NONE)
-            header = tuple(next(reader))
-            table = detect_table(source_filename, header)
-            columns = header + PROVENANCE_COLUMNS
-            schema = pa.schema(
-                [pa.field(column, pa.string(), nullable=True) for column in columns],
-                metadata={b"parser_version": parser_version.encode()},
-            )
-            parquet_temporary = _temporary_sibling(target_path)
-            rejects_temporary = _temporary_sibling(reject_path)
+            previous_field_limit = csv.field_size_limit(MAX_FIELD_SIZE)
+            try:
+                reader = csv.reader(source_handle, delimiter="|", quoting=csv.QUOTE_NONE)
+                header = tuple(next(reader))
+                table = detect_table(source_filename, header)
+                columns = header + PROVENANCE_COLUMNS
+                schema = pa.schema(
+                    [pa.field(column, pa.string(), nullable=True) for column in columns],
+                    metadata={b"parser_version": parser_version.encode()},
+                )
+                parquet_temporary = _temporary_sibling(target_path)
+                rejects_temporary = _temporary_sibling(reject_path)
 
-            rows_seen = 0
-            rows_accepted = 0
-            rows_rejected = 0
-            batch: list[dict[str, str]] = []
-            with (
-                pq.ParquetWriter(parquet_temporary, schema) as writer,
-                rejects_temporary.open("w", encoding="utf-8", newline="\n") as rejects_handle,
-            ):
-                for row in reader:
-                    rows_seen += 1
-                    if len(row) != len(header):
-                        rows_rejected += 1
-                        _write_reject(
-                            rejects_handle,
-                            line_number=reader.line_num,
-                            reason="field_count",
-                            expected_field_count=len(header),
-                            actual_field_count=len(row),
-                            row=row,
-                            source_snapshot_sha256=provenance_source.sha256,
-                            source_filename=source_filename,
-                            parser_version=parser_version,
+                rows_seen = 0
+                rows_accepted = 0
+                rows_rejected = 0
+                batch: list[dict[str, str]] = []
+                with (
+                    pq.ParquetWriter(parquet_temporary, schema) as writer,
+                    rejects_temporary.open("w", encoding="utf-8", newline="\n") as rejects_handle,
+                ):
+                    for row in reader:
+                        rows_seen += 1
+                        if len(row) != len(header):
+                            rows_rejected += 1
+                            _write_reject(
+                                rejects_handle,
+                                line_number=reader.line_num,
+                                reason="field_count",
+                                expected_field_count=len(header),
+                                actual_field_count=len(row),
+                                row=row,
+                                source_snapshot_sha256=provenance_source.sha256,
+                                source_filename=source_filename,
+                                parser_version=parser_version,
+                            )
+                            continue
+
+                        accepted = dict(zip(header, row, strict=True))
+                        if _has_missing_business_key(accepted, table):
+                            rows_rejected += 1
+                            _write_reject(
+                                rejects_handle,
+                                line_number=reader.line_num,
+                                reason="missing_business_key",
+                                expected_field_count=len(header),
+                                actual_field_count=len(row),
+                                row=row,
+                                source_snapshot_sha256=provenance_source.sha256,
+                                source_filename=source_filename,
+                                parser_version=parser_version,
+                            )
+                            continue
+
+                        accepted.update(
+                            {
+                                "_source_line_number": str(reader.line_num),
+                                "_source_snapshot_sha256": provenance_source.sha256,
+                                "_source_filename": source_filename,
+                            }
                         )
-                        continue
+                        batch.append(accepted)
+                        rows_accepted += 1
+                        if len(batch) == batch_rows:
+                            _write_batch(writer, schema, batch)
+                            batch = []
 
-                    accepted = dict(zip(header, row, strict=True))
-                    if _has_missing_business_key(accepted, table):
-                        rows_rejected += 1
-                        _write_reject(
-                            rejects_handle,
-                            line_number=reader.line_num,
-                            reason="missing_business_key",
-                            expected_field_count=len(header),
-                            actual_field_count=len(row),
-                            row=row,
-                            source_snapshot_sha256=provenance_source.sha256,
-                            source_filename=source_filename,
-                            parser_version=parser_version,
-                        )
-                        continue
-
-                    accepted.update(
-                        {
-                            "_source_line_number": str(reader.line_num),
-                            "_source_snapshot_sha256": provenance_source.sha256,
-                            "_source_filename": source_filename,
-                        }
-                    )
-                    batch.append(accepted)
-                    rows_accepted += 1
-                    if len(batch) == batch_rows:
+                    if batch:
                         _write_batch(writer, schema, batch)
-                        batch = []
-
-                if batch:
-                    _write_batch(writer, schema, batch)
+            finally:
+                csv.field_size_limit(previous_field_limit)
 
         assert parquet_temporary is not None
         assert rejects_temporary is not None

@@ -71,3 +71,12 @@ def test_streams_archive_member_and_closes_zip_handles(tmp_path: Path) -> None:
         member_handle = stream.buffer
     assert stream.closed
     assert member_handle.closed
+
+
+def test_source_encoding_scans_beyond_the_initial_sample_in_bounded_chunks(tmp_path: Path) -> None:
+    from maude.ingestion.archive import select_source_encoding
+
+    source = tmp_path / "patient.txt"
+    source.write_bytes(b"header\n" + b"a" * 65_536 + b"\xb0\n")
+
+    assert select_source_encoding(source) == "cp1252"

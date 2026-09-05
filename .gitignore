@@ -4,6 +4,8 @@ data/silver/
 data/gold/
 data/staging/
 data/rejects/
+data/manifests/
+data/locks/
 *.zip
 DEVICE*.txt
 device*.txt
