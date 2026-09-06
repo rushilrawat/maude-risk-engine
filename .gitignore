@@ -2,6 +2,10 @@ data/raw/
 data/bronze/
 data/silver/
 data/gold/
+data/staging/
+data/rejects/
+data/manifests/
+data/locks/
 *.zip
 DEVICE*.txt
 device*.txt
@@ -20,6 +24,10 @@ models/
 .env
 .venv/
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .ipynb_checkpoints/
 .DS_Store
 .worktrees/
+.superpowers/
