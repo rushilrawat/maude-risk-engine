@@ -121,7 +121,7 @@ Run: `uv run pytest tests/unit/test_layout.py tests/unit/test_manifests.py tests
 
 Expected: PASS, including existing local snapshot recovery and promotion tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/maude/domain/enums.py src/maude/domain/models.py src/maude/storage/layout.py src/maude/ingestion/manifests.py src/maude/ingestion/pipeline.py tests/unit/test_layout.py tests/unit/test_manifests.py
@@ -141,7 +141,7 @@ git commit -m "feat: add FDA refresh contracts"
 - Produces: `HttpResponse` and `UrlOpener` protocols plus `open_url(request: Request, timeout: float) -> HttpResponse`.
 - Produces: `fetch_current_catalog(opener: UrlOpener, layout: RefreshLayout, retrieved_at: datetime) -> tuple[CatalogEvidence, tuple[DiscoveredArtifact, ...]]`.
 
-- [ ] **Step 1: Write failing allowlist tests**
+- [x] **Step 1: Write failing allowlist tests**
 
 Build one compact HTML fixture with unrelated historical/problem-code links and the 12 required links. Define `valid_catalog_html()` by joining anchors for the 12 literal filenames in the allowlist between `<h2>MAUDE Data Downloadable Files</h2>` and `<h2>Alternative Summary Reports</h2>`. Assert exact deterministic `(table, role, filename)` output. Add one focused test each for a missing artifact, duplicate artifact, HTTP URL, wrong host, unexpected port/user-info/fragment, link outside the MAUDE table section, and mismatched catalog final URL.
 
@@ -152,13 +152,13 @@ assert [(item.table, item.role) for item in artifacts] == [
 ]
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `uv run pytest tests/unit/test_fda_catalog.py -q`
 
 Expected: collection fails because `maude.ingestion.fda_catalog` does not exist.
 
-- [ ] **Step 3: Implement exact discovery**
+- [x] **Step 3: Implement exact discovery**
 
 Define the shared network boundary in `http.py`:
 
@@ -195,13 +195,13 @@ CURRENT_ARCHIVES = {
 
 Validate scheme, hostname, port, user-info, and fragment after `urljoin`. Fetch through an injected opener, hash/store the exact page bytes through `RefreshLayout.catalogs`, decode from declared charset with UTF-8 fallback only when no charset is declared, and record response metadata.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run: `uv run pytest tests/unit/test_fda_catalog.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/maude/ingestion/http.py src/maude/ingestion/fda_catalog.py tests/unit/test_fda_catalog.py
