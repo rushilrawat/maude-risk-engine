@@ -97,7 +97,7 @@ def _validate_catalog_url(url: str) -> None:
         raise CatalogError(f"untrusted catalog URL: {url}")
 
 
-def _validate_archive_url(url: str) -> str:
+def validate_archive_url(url: str) -> str:
     path, query = _url_parts(url, label="archive URL", host="www.accessdata.fda.gov")
     if query:
         raise CatalogError(f"untrusted archive URL: {url}")
@@ -118,7 +118,7 @@ def parse_current_catalog(html: str, catalog_url: str) -> tuple[DiscoveredArtifa
         classification = CURRENT_ARCHIVES.get(filename)
         if classification is None:
             continue
-        trusted_filename = _validate_archive_url(url)
+        trusted_filename = validate_archive_url(url)
         table, role = classification
         key = (table, role)
         if key in discovered:

@@ -220,7 +220,7 @@ git commit -m "feat: discover current FDA archives"
 - Produces: `download_artifact(artifact: DiscoveredArtifact, layout: RefreshLayout, opener: UrlOpener, started_at: datetime) -> DownloadedArtifact`.
 - Produces: `detect_source_role(filename: str) -> SourceRole` for exact member-role validation.
 
-- [ ] **Step 1: Write failing downloader tests**
+- [x] **Step 1: Write failing downloader tests**
 
 Use in-memory fake HTTP responses and real tiny ZIP bytes. Prove bounded chunk reads, correct SHA-256 path, metadata capture, existing-object reuse, and cleanup after each failure. Parametrize failures for wrong redirect host, malformed/missing/negative `Content-Length`, truncated response, body above `MAX_DOWNLOAD_BYTES`, CRC failure, multiple members, unsafe member path, non-text member, wrong family, wrong role, and missing required columns.
 
@@ -231,25 +231,25 @@ assert downloaded.sha256 == hashlib.sha256(zip_bytes).hexdigest()
 assert list(layout.raw_root.rglob("*.tmp")) == []
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `uv run pytest tests/unit/test_download.py -q`
 
 Expected: collection fails because the downloader does not exist.
 
-- [ ] **Step 3: Implement download admission**
+- [x] **Step 3: Implement download admission**
 
 Stream `1024 * 1024` byte blocks with `MAX_DOWNLOAD_BYTES = 2 * 1024**3`. Use `tempfile.mkstemp` beside the target, update SHA-256/count while writing, flush and sync, then inspect the temporary ZIP. Check detected table and member role against the discovered artifact before `Path.replace`. If the checksum target already exists, verify its checksum and bytesize, discard the temporary duplicate, and return the existing path.
 
 Every exception unlinks only the invocation's temporary file. It never deletes an existing raw object.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run: `uv run pytest tests/unit/test_download.py tests/unit/test_archive.py tests/unit/test_schemas.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/maude/ingestion/download.py src/maude/ingestion/schemas.py tests/unit/test_download.py

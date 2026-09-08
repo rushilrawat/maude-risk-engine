@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from os import PathLike
 
-from maude.domain.enums import TableKind
+from maude.domain.enums import SourceRole, TableKind
 
 
 class SchemaMismatch(ValueError):
@@ -56,6 +56,16 @@ def normalize_column(name: str) -> str:
     """Normalize a source header into a stable snake-case identifier."""
     value = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
     return re.sub(r"_+", "_", value)
+
+
+def detect_source_role(filename: str | PathLike[str]) -> SourceRole:
+    """Classify the role encoded by one FDA current-year member filename."""
+    stem = str(filename).rsplit("/", 1)[-1].rsplit(".", 1)[0].casefold()
+    if stem.endswith("change"):
+        return SourceRole.CHANGE
+    if stem.endswith("add"):
+        return SourceRole.ADD
+    return SourceRole.BASE
 
 
 def spec_for(kind: TableKind) -> TableSpec:

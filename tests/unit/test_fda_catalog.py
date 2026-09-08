@@ -85,9 +85,7 @@ def test_catalog_rejects_missing_current_archive() -> None:
 
 def test_catalog_rejects_duplicate_current_archive() -> None:
     with pytest.raises(CatalogError, match=r"duplicate.*master/base"):
-        parse_current_catalog(
-            _catalog_html(links=(*ARCHIVE_NAMES, "mdrfoi.zip")), FDA_CATALOG_URL
-        )
+        parse_current_catalog(_catalog_html(links=(*ARCHIVE_NAMES, "mdrfoi.zip")), FDA_CATALOG_URL)
 
 
 @pytest.mark.parametrize(
