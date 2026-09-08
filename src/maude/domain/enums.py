@@ -8,6 +8,19 @@ class TableKind(StrEnum):
     NARRATIVE = "narrative"
 
 
+class SourceRole(StrEnum):
+    BASE = "base"
+    ADD = "add"
+    CHANGE = "change"
+
+
+class RefreshOutcome(StrEnum):
+    RUNNING = "running"
+    PROMOTED = "promoted"
+    UNCHANGED = "unchanged"
+    FAILED = "failed"
+
+
 class RunStatus(StrEnum):
     RUNNING = "running"
     FAILED = "failed"

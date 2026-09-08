@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from maude.domain.enums import QualityLevel, RunStatus, TableKind
+from maude.domain.enums import QualityLevel, RefreshOutcome, RunStatus, SourceRole, TableKind
 
 
 class ContractModel(BaseModel):
@@ -20,6 +20,7 @@ class SourceIdentity(ContractModel):
     byte_size: int = Field(ge=0)
     archive_member: str | None
     encoding: str
+    source_role: SourceRole | None = None
 
 
 class ParseStats(ContractModel):
@@ -45,6 +46,90 @@ class TableResult(ContractModel):
     reject_path: str
     stats: ParseStats
     quality: Sequence[QualityResult]
+    sources: tuple[SourceIdentity, ...] = ()
+
+
+class CatalogEvidence(ContractModel):
+    catalog_url: str
+    retrieved_at: datetime
+    final_url: str
+    etag: str | None = None
+    last_modified: str | None = None
+    sha256: str
+    html_path: str
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("catalog retrieval timestamp must be timezone-aware")
+        return value
+
+
+class DiscoveredArtifact(ContractModel):
+    table: TableKind
+    role: SourceRole
+    filename: str
+    url: str
+
+
+class DownloadedArtifact(DiscoveredArtifact):
+    started_at: datetime
+    completed_at: datetime
+    final_url: str
+    etag: str | None = None
+    last_modified: str | None = None
+    byte_size: int = Field(ge=0)
+    sha256: str
+    raw_path: str
+    archive_member: str
+    encoding: str
+    header: tuple[str, ...]
+
+    @field_validator("started_at", "completed_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("download timestamps must be timezone-aware")
+        return value
+
+
+class ReconciliationStats(ContractModel):
+    table: TableKind
+    role: SourceRole
+    inserted: int = Field(ge=0)
+    updated: int = Field(ge=0)
+    unchanged: int = Field(ge=0)
+    superseded: int = Field(ge=0)
+
+
+class RefreshFailure(ContractModel):
+    phase: str
+    table: TableKind | None = None
+    role: SourceRole | None = None
+    url: str | None = None
+    error_type: str
+    message: str
+
+
+class RefreshRunResult(ContractModel):
+    run_id: UUID
+    started_at: datetime
+    finished_at: datetime | None
+    outcome: RefreshOutcome
+    catalog: CatalogEvidence | None = None
+    artifacts: Sequence[DownloadedArtifact] = ()
+    reconciliation: Sequence[ReconciliationStats] = ()
+    refresh_fingerprint: str | None = None
+    snapshot_id: str | None = None
+    failure: RefreshFailure | None = None
+
+    @field_validator("started_at", "finished_at")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("refresh run timestamps must be timezone-aware")
+        return value
 
 
 class FailureEvidence(ContractModel):

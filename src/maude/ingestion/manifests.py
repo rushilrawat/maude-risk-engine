@@ -5,6 +5,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from maude.domain.models import SnapshotResult
 
 
@@ -31,8 +33,8 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def write_manifest(path: Path, snapshot: SnapshotResult) -> None:
-    """Atomically persist a validated snapshot manifest at *path*."""
+def write_json_model(path: Path, model: BaseModel) -> None:
+    """Atomically persist a validated Pydantic model at *path*."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -41,7 +43,7 @@ def write_manifest(path: Path, snapshot: SnapshotResult) -> None:
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(snapshot.model_dump_json(indent=2))
+            handle.write(model.model_dump_json(indent=2))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -50,6 +52,11 @@ def write_manifest(path: Path, snapshot: SnapshotResult) -> None:
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
+
+
+def write_manifest(path: Path, snapshot: SnapshotResult) -> None:
+    """Atomically persist a validated snapshot manifest at *path*."""
+    write_json_model(path, snapshot)
 
 
 def load_manifest(path: Path) -> SnapshotResult:

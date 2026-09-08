@@ -371,6 +371,7 @@ def _process_table(
         quality=[
             _date_parse_quality(normalization.date_parse_failure_count, bronze.stats.rows_accepted)
         ],
+        sources=(bronze.source,),
     )
 
 

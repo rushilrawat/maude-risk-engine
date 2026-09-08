@@ -40,7 +40,7 @@
 - Produces: `write_json_model(path: Path, model: BaseModel) -> None` for durable strict-model persistence.
 - Preserves: existing local-ingestion behavior and `TableResult.source`.
 
-- [ ] **Step 1: Write failing contract tests**
+- [x] **Step 1: Write failing contract tests**
 
 ```python
 def test_refresh_layout_separates_raw_objects_and_run_manifests(tmp_path: Path) -> None:
@@ -80,13 +80,13 @@ def test_table_result_records_all_contributing_sources() -> None:
     ]
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `uv run pytest tests/unit/test_layout.py tests/unit/test_manifests.py -q`
 
 Expected: collection fails because the refresh contracts and layout do not exist.
 
-- [ ] **Step 3: Implement the minimal contracts**
+- [x] **Step 3: Implement the minimal contracts**
 
 Add:
 
@@ -111,11 +111,11 @@ class ReconciliationStats(ContractModel):
     superseded: int = Field(ge=0)
 ```
 
-Define the remaining spec fields with strict URL strings, timezone-aware datetimes, nonnegative sizes/counts, and optional HTTP headers. Define `RefreshOutcome` with `promoted`, `unchanged`, and `failed`. Add `source_role: SourceRole | None = None` to `SourceIdentity` and `sources: Sequence[SourceIdentity] = ()` to `TableResult`. Extend the existing `test_shared_models_validate_bounds_and_preserve_fields` test using its local `table` value, and populate `sources=(bronze.source,)` in existing local ingestion.
+Define the remaining spec fields with strict URL strings, timezone-aware datetimes, nonnegative sizes/counts, and optional HTTP headers. Define `RefreshOutcome` with `running`, `promoted`, `unchanged`, and `failed`. Add `source_role: SourceRole | None = None` to `SourceIdentity` and `sources: tuple[SourceIdentity, ...] = ()` to `TableResult`. Extend the existing `test_shared_models_validate_bounds_and_preserve_fields` test using its local `table` value, and populate `sources=(bronze.source,)` in existing local ingestion.
 
 `RefreshLayout` creates paths only from a configured data root, validated UUID, and validated 64-character lowercase hex digest. Generalize the existing atomic JSON writer without changing snapshot-manifest serialization.
 
-- [ ] **Step 4: Run focused and regression tests**
+- [x] **Step 4: Run focused and regression tests**
 
 Run: `uv run pytest tests/unit/test_layout.py tests/unit/test_manifests.py tests/integration/test_pipeline.py -q`
 
