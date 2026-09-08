@@ -271,11 +271,11 @@ git commit -m "feat: store validated FDA downloads"
 - Produces: `reconcile_table(table: TableKind, role_paths: Mapping[SourceRole, Path], output_path: Path) -> tuple[ReconciliationStats, ...]`.
 - Preserves: normalized FDA columns and all provenance columns on the selected row.
 
-- [ ] **Step 1: Write failing provenance tests**
+- [x] **Step 1: Write failing provenance tests**
 
 Pass `SourceIdentity(source_role=SourceRole.CHANGE, ...)` into `parse_to_bronze`; assert `_source_role == "change"` in Bronze and Silver. Assert local sources with no role remain accepted and produce a null role.
 
-- [ ] **Step 2: Write failing reconciliation tests**
+- [x] **Step 2: Write failing reconciliation tests**
 
 Create tiny Parquet fixtures for all four key shapes. Assert:
 
@@ -287,13 +287,13 @@ Create tiny Parquet fixtures for all four key shapes. Assert:
 - duplicate keys within one role raise `ReconciliationError`; and
 - stats reconcile to input and selected counts.
 
-- [ ] **Step 3: Run and verify RED**
+- [x] **Step 3: Run and verify RED**
 
 Run: `uv run pytest tests/unit/test_parser.py tests/unit/test_reconcile.py -q`
 
 Expected: provenance assertions fail and reconciliation module is missing.
 
-- [ ] **Step 4: Implement minimal role provenance and DuckDB selection**
+- [x] **Step 4: Implement minimal role provenance and DuckDB selection**
 
 Add `_source_role` to `PROVENANCE_COLUMNS`, populated from `SourceIdentity.source_role`. Build a union with numeric role priority and reject duplicates using grouped business-key counts per role. Select with:
 
@@ -306,13 +306,13 @@ row_number() OVER (
 
 Write only rank 1, excluding the temporary priority/rank fields. Use the existing quote helpers' escaping rules and atomic sibling replacement pattern. Calculate stats with grouped joins on business key and `record_content_hash`.
 
-- [ ] **Step 5: Run focused and quality tests**
+- [x] **Step 5: Run focused and quality tests**
 
 Run: `uv run pytest tests/unit/test_parser.py tests/unit/test_normalize.py tests/unit/test_reconcile.py tests/unit/test_quality.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/maude/ingestion/parser.py src/maude/ingestion/normalize.py src/maude/ingestion/reconcile.py src/maude/quality/checks.py tests/unit/test_parser.py tests/unit/test_reconcile.py
