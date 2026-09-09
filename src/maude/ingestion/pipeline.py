@@ -23,12 +23,15 @@ from shutil import rmtree
 from uuid import uuid4
 
 from maude.config import Settings
-from maude.domain.enums import QualityLevel, RunStatus, TableKind
+from maude.domain.enums import QualityLevel, RunStatus, SourceRole, TableKind
 from maude.domain.models import (
+    DownloadedArtifact,
     FailureEvidence,
     InspectedSource,
+    ParseStats,
     PromotionIntent,
     QualityResult,
+    ReconciliationStats,
     SnapshotResult,
     SourceIdentity,
     TableResult,
@@ -37,6 +40,7 @@ from maude.ingestion.archive import inspect_source, select_source_encoding, sha2
 from maude.ingestion.manifests import fsync_directory, load_manifest, write_manifest
 from maude.ingestion.normalize import normalize_bronze
 from maude.ingestion.parser import parse_to_bronze
+from maude.ingestion.reconcile import reconcile_table
 from maude.ingestion.schemas import TABLE_SPECS, SchemaMismatch, spec_for
 from maude.quality.checks import has_blocking_failure, run_quality_checks
 from maude.storage.layout import SnapshotLayout
@@ -688,3 +692,212 @@ def ingest_snapshot(
         except Exception:
             raise failure_error from None
         return failed
+
+
+def _downloaded_sources(
+    artifacts: Sequence[DownloadedArtifact],
+) -> dict[TableKind, dict[SourceRole, DownloadedArtifact]]:
+    discovered: dict[TableKind, dict[SourceRole, DownloadedArtifact]] = {}
+    for artifact in artifacts:
+        roles = discovered.setdefault(artifact.table, {})
+        if artifact.role in roles:
+            raise ValueError(
+                f"multiple {artifact.role.value} sources detected for {artifact.table.value}"
+            )
+        roles[artifact.role] = artifact
+    missing = [
+        f"{table.value}/{role.value}"
+        for table in TableKind
+        for role in SourceRole
+        if role not in discovered.get(table, {})
+    ]
+    if missing:
+        raise ValueError(f"missing downloaded sources: {', '.join(missing)}")
+    return discovered
+
+
+def _download_identity(artifact: DownloadedArtifact) -> SourceIdentity:
+    return SourceIdentity(
+        path=artifact.raw_path,
+        filename=artifact.archive_member,
+        sha256=artifact.sha256,
+        byte_size=artifact.byte_size,
+        archive_member=artifact.archive_member,
+        encoding=artifact.encoding,
+        source_role=artifact.role,
+    )
+
+
+def ingest_role_snapshot(
+    snapshot_id: str,
+    artifacts: Sequence[DownloadedArtifact],
+    settings: Settings,
+) -> SnapshotResult:
+    """Parse and publish one downloaded base/add/change source set."""
+    _require_snapshot_id(snapshot_id)
+    grouped = _downloaded_sources(artifacts)
+    ordered_artifacts = tuple(grouped[table][role] for table in TableKind for role in SourceRole)
+    source_paths = tuple(Path(artifact.raw_path) for artifact in ordered_artifacts)
+    inputs = tuple(_download_identity(artifact) for artifact in ordered_artifacts)
+    layout = SnapshotLayout(settings.data_root, snapshot_id)
+    locks_root = _prepare_layout(layout)
+    with _snapshot_claim(locks_root, snapshot_id):
+        if layout.manifest.exists():
+            existing = load_manifest(layout.manifest)
+            if (
+                existing.status is RunStatus.PROMOTED
+                and layout.current_manifest.exists()
+                and load_manifest(layout.current_manifest).snapshot_id != existing.snapshot_id
+            ):
+                if not _same_sources(existing, source_paths):
+                    raise SnapshotConflict(
+                        "snapshot_id is already associated with different source checksums"
+                    )
+                _validate_promoted_artifacts(layout, existing)
+                current = load_manifest(layout.current_manifest)
+                republish_quality = run_quality_checks(existing.tables, current)
+                if has_blocking_failure(republish_quality):
+                    return existing.model_copy(
+                        update={
+                            "status": RunStatus.FAILED,
+                            "promoted_path": None,
+                            "quality": republish_quality,
+                            "failure": FailureEvidence(
+                                phase="quality",
+                                error_type="BlockingQualityFailure",
+                                message="existing snapshot failed quality checks before republish",
+                            ),
+                        }
+                    )
+                write_manifest(layout.current_manifest, existing)
+                return existing
+            return _recover_existing(layout, existing, source_paths)
+        started_at = datetime.now(UTC)
+        running = SnapshotResult(
+            run_id=uuid4(),
+            snapshot_id=snapshot_id,
+            started_at=started_at,
+            finished_at=None,
+            status=RunStatus.RUNNING,
+            tables=(),
+            quality=(),
+            promoted_path=None,
+            parser_version=settings.parser_version,
+            inputs=inputs,
+            promotion=PromotionIntent(phase="running"),
+        )
+        write_manifest(layout.manifest, running)
+        tables: list[TableResult] = []
+        reconciliation_stats: list[ReconciliationStats] = []
+        quality: tuple[QualityResult, ...] = ()
+        active_table: TableKind | None = None
+        active_phase = "staging_setup"
+        try:
+            _prepare_staging(layout)
+            roles_root = layout.staging / "roles"
+            _ensure_real_directory(roles_root)
+            for table in TableKind:
+                active_table = table
+                active_phase = "parse"
+                bronze_root = layout.bronze / table.value
+                reject_root = layout.rejects / table.value
+                _ensure_real_directory(bronze_root)
+                _ensure_real_directory(reject_root)
+                normalized_paths: dict[SourceRole, Path] = {}
+                sources: list[SourceIdentity] = []
+                parse_results = []
+                date_failures = 0
+                for role in SourceRole:
+                    artifact = grouped[table][role]
+                    source_path = Path(artifact.raw_path)
+                    inspected = inspect_source(source_path)
+                    identity = _download_identity(artifact)
+                    bronze = parse_to_bronze(
+                        source_path,
+                        bronze_root / f"{role.value}.parquet",
+                        reject_root / f"{role.value}.jsonl",
+                        settings.batch_rows,
+                        settings.parser_version,
+                        inspected,
+                        identity,
+                    )
+                    role_silver = roles_root / f"{table.value}-{role.value}.parquet"
+                    normalized = normalize_bronze(
+                        Path(bronze.bronze_path), role_silver, spec_for(table), snapshot_id
+                    )
+                    normalized_paths[role] = role_silver
+                    sources.append(bronze.source)
+                    parse_results.append(bronze.stats)
+                    date_failures += normalized.date_parse_failure_count
+                active_phase = "reconcile"
+                reconciliation_stats.extend(
+                    reconcile_table(
+                        table,
+                        normalized_paths,
+                        layout.silver / f"{table.value}.parquet",
+                    )
+                )
+                stats = ParseStats(
+                    rows_seen=sum(result.rows_seen for result in parse_results),
+                    rows_accepted=sum(result.rows_accepted for result in parse_results),
+                    rows_rejected=sum(result.rows_rejected for result in parse_results),
+                    columns=parse_results[0].columns,
+                )
+                tables.append(
+                    TableResult(
+                        table=table,
+                        source=sources[0],
+                        sources=tuple(sources),
+                        bronze_path=str(bronze_root),
+                        silver_path=str(layout.silver / f"{table.value}.parquet"),
+                        reject_path=str(reject_root),
+                        stats=stats,
+                        quality=(_date_parse_quality(date_failures, stats.rows_accepted),),
+                    )
+                )
+            active_phase = "quality"
+            previous = (
+                load_manifest(layout.current_manifest) if layout.current_manifest.exists() else None
+            )
+            quality = run_quality_checks(tables, previous)
+            if has_blocking_failure(quality):
+                failed = _failed_snapshot(
+                    running,
+                    tables,
+                    quality,
+                    FailureEvidence(
+                        phase="quality",
+                        error_type="BlockingQualityFailure",
+                        message="one or more blocking quality checks failed",
+                    ),
+                )
+                failed = failed.model_copy(update={"reconciliation": tuple(reconciliation_stats)})
+                write_manifest(layout.manifest, failed)
+                return failed
+            validated = running.model_copy(
+                update={
+                    "finished_at": datetime.now(UTC),
+                    "status": RunStatus.VALIDATED,
+                    "tables": tables,
+                    "quality": quality,
+                    "reconciliation": tuple(reconciliation_stats),
+                    "promotion": PromotionIntent(phase="validated"),
+                }
+            )
+            write_manifest(layout.manifest, validated)
+            return _finish_promotion(layout, validated)
+        except Exception as error:
+            failed = _failed_snapshot(
+                running,
+                tables,
+                (*quality, _failure_quality(error)),
+                FailureEvidence(
+                    phase=active_phase,
+                    table=active_table,
+                    error_type=type(error).__name__,
+                    message=str(error),
+                ),
+            )
+            failed = failed.model_copy(update={"reconciliation": tuple(reconciliation_stats)})
+            write_manifest(layout.manifest, failed)
+            return failed

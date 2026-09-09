@@ -333,7 +333,7 @@ git commit -m "feat: reconcile FDA source roles"
 - Produces: `refresh_fda(settings: Settings, opener: UrlOpener | None = None, now: Callable[[], datetime] | None = None) -> RefreshRunResult`; `None` uses `datetime.now(UTC)`.
 - Consumes: `RefreshOutcome` values `promoted`, `unchanged`, and `failed` from Task 1.
 
-- [ ] **Step 1: Write failing integration tests**
+- [x] **Step 1: Write failing integration tests**
 
 Drive the orchestrator with a fake catalog/ZIP opener. Assert:
 
@@ -345,13 +345,13 @@ Drive the orchestrator with a fake catalog/ZIP opener. Assert:
 - every failure preserves pre-existing `current.json` bytes; and
 - an interrupted snapshot follows the current recovery contract.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `uv run pytest tests/integration/test_refresh.py -q`
 
 Expected: collection fails because `refresh_fda` does not exist.
 
-- [ ] **Step 3: Implement the refresh transaction**
+- [x] **Step 3: Implement the refresh transaction**
 
 Create one UUID run and immediately persist a running refresh-run manifest. Fetch/store the catalog, download sequentially in deterministic order, compute the fingerprint from canonical compact JSON, and derive the snapshot ID.
 
@@ -359,13 +359,13 @@ Before parsing, compare the 12 `(table, role, sha256)` identities with the curre
 
 For changed inputs, use the existing per-snapshot advisory claim. Parse each role into distinct staging paths, reconcile into the four expected Silver paths, run current quality checks, and use the existing durable promotion state machine. Update the refresh-run manifest after terminal success or failure. Convert expected operational exceptions to a failed result; do not catch `KeyboardInterrupt`, `SystemExit`, or other `BaseException` subclasses.
 
-- [ ] **Step 4: Run focused integration and regression tests**
+- [x] **Step 4: Run focused integration and regression tests**
 
 Run: `uv run pytest tests/integration/test_refresh.py tests/integration/test_pipeline.py tests/integration/test_duckdb_views.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/maude/ingestion/refresh.py src/maude/ingestion/pipeline.py src/maude/ingestion/manifests.py src/maude/storage/layout.py tests/integration/test_refresh.py

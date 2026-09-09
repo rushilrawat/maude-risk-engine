@@ -160,6 +160,7 @@ class SnapshotResult(ContractModel):
     promoted_path: str | None
     parser_version: str
     inputs: Sequence[SourceIdentity] = ()
+    reconciliation: Sequence[ReconciliationStats] = Field(default_factory=list)
     failure: FailureEvidence | None = None
     promotion: PromotionIntent | None = None
 
