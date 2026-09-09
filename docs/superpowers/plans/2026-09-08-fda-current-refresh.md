@@ -384,7 +384,7 @@ git commit -m "feat: orchestrate FDA current refresh"
 - Consumes: `refresh_fda(settings)`.
 - Produces: `maude refresh-fda` with stable output and exit codes.
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Monkeypatch only the orchestration boundary. Assert exact output prefixes and exits:
 
@@ -400,23 +400,23 @@ assert failed.stdout.startswith("FAILED download ")
 assert "refresh-runs/" in failed.stdout
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `uv run pytest tests/integration/test_cli_refresh.py -q`
 
 Expected: Typer reports that command `refresh-fda` does not exist.
 
-- [ ] **Step 3: Implement the minimal CLI and runbook**
+- [x] **Step 3: Implement the minimal CLI and runbook**
 
 Add one command with no URL or snapshot arguments. Print the terminal state, snapshot ID when known, catalog retrieval timestamp for success, per-family selected counts, and refresh-run manifest path for failure. Document configuration, expected disk usage, status meanings, evidence paths, safe rerun behavior, and the passive-reporting limitation. Add one README link to the runbook.
 
-- [ ] **Step 4: Run focused CLI tests**
+- [x] **Step 4: Run focused CLI tests**
 
 Run: `uv run pytest tests/integration/test_cli_refresh.py tests/integration/test_cli_audit.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Run the complete local verification gate**
+- [x] **Step 5: Run the complete local verification gate**
 
 Run: `make verify`
 
