@@ -11,6 +11,7 @@ from typing import TextIO
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from maude.domain.enums import SourceRole
 from maude.domain.models import BronzeResult, InspectedSource, ParseStats, SourceIdentity
 from maude.ingestion.archive import inspect_source, open_source_text, select_source_encoding
 from maude.ingestion.schemas import TableSpec, detect_table, normalize_column
@@ -19,6 +20,7 @@ PROVENANCE_COLUMNS = (
     "_source_line_number",
     "_source_snapshot_sha256",
     "_source_filename",
+    "_source_role",
 )
 MAX_FIELD_SIZE = 16 * 1024 * 1024
 
@@ -121,6 +123,9 @@ def parse_to_bronze(
         archive_member=inspected.member,
         encoding=encoding,
     )
+    source_role = provenance_source.source_role or SourceRole.BASE
+    if provenance_source.source_role is None:
+        provenance_source = provenance_source.model_copy(update={"source_role": source_role})
     source_filename = provenance_source.filename
     parquet_temporary: Path | None = None
     rejects_temporary: Path | None = None
@@ -191,6 +196,7 @@ def parse_to_bronze(
                                 "_source_line_number": str(reader.line_num),
                                 "_source_snapshot_sha256": provenance_source.sha256,
                                 "_source_filename": source_filename,
+                                "_source_role": source_role.value,
                             }
                         )
                         batch.append(accepted)

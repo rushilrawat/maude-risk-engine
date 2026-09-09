@@ -5,7 +5,7 @@ from uuid import uuid4
 import maude.ingestion.manifests as manifests
 from maude.domain.enums import RunStatus
 from maude.domain.models import SnapshotResult
-from maude.ingestion.manifests import load_manifest, write_manifest
+from maude.ingestion.manifests import load_manifest, write_json_model, write_manifest
 
 
 def _snapshot() -> SnapshotResult:
@@ -31,3 +31,13 @@ def test_manifest_replace_fsyncs_its_parent_directory(tmp_path: Path, monkeypatc
 
     assert synced == [path.parent]
     assert load_manifest(path).snapshot_id == "fixture-2025-06"
+
+
+def test_json_model_writer_preserves_strict_model_content(tmp_path: Path) -> None:
+    path = tmp_path / "refresh-runs" / "run.json"
+    snapshot = _snapshot()
+
+    write_json_model(path, snapshot)
+
+    restored = SnapshotResult.model_validate_json(path.read_text(encoding="utf-8"))
+    assert restored.model_dump(mode="json") == snapshot.model_dump(mode="json")

@@ -11,7 +11,11 @@ from hypothesis import strategies as st
 
 import maude.ingestion.archive as archive
 import maude.ingestion.parser as parser
+from maude.domain.enums import SourceRole, TableKind
+from maude.domain.models import SourceIdentity
+from maude.ingestion.normalize import normalize_bronze
 from maude.ingestion.parser import parse_to_bronze
+from maude.ingestion.schemas import spec_for
 
 
 def test_parser_streams_valid_rows_and_records_bad_field_count(tmp_path: Path) -> None:
@@ -185,6 +189,7 @@ def test_parser_emits_empty_parquet_with_full_schema(tmp_path: Path) -> None:
         "_source_line_number",
         "_source_snapshot_sha256",
         "_source_filename",
+        "_source_role",
     ]
     assert all(field.type == pa.string() for field in bronze.schema)
 
@@ -211,8 +216,43 @@ def test_parser_records_source_attribution_and_encoding(tmp_path: Path) -> None:
             "_source_line_number": "2",
             "_source_snapshot_sha256": result.source.sha256,
             "_source_filename": "patient.txt",
+            "_source_role": "base",
         }
     ]
+
+
+def test_parser_preserves_explicit_source_role_through_normalization(tmp_path: Path) -> None:
+    source = tmp_path / "patientchange.txt"
+    source.write_text("MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER\n1|2\n", encoding="utf-8")
+    inspected = archive.inspect_source(source)
+    identity = SourceIdentity(
+        path=str(source),
+        filename=source.name,
+        sha256=inspected.sha256,
+        byte_size=inspected.byte_size,
+        archive_member=None,
+        encoding="utf-8",
+        source_role=SourceRole.CHANGE,
+    )
+    bronze = tmp_path / "bronze.parquet"
+
+    parse_to_bronze(
+        source,
+        bronze,
+        tmp_path / "rejects.jsonl",
+        batch_rows=1,
+        inspected=inspected,
+        source_identity=identity,
+    )
+    normalized = normalize_bronze(
+        bronze,
+        tmp_path / "silver.parquet",
+        spec_for(TableKind.PATIENT),
+        "snapshot",
+    )
+
+    assert pq.read_table(bronze).to_pylist()[0]["_source_role"] == "change"
+    assert pq.read_table(normalized.silver_path).to_pylist()[0]["_source_role"] == "change"
 
 
 def test_parser_keeps_final_outputs_when_batch_write_fails(

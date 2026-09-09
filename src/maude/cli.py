@@ -4,10 +4,11 @@ import typer
 
 from maude import __version__
 from maude.config import Settings
-from maude.domain.enums import QualityLevel, RunStatus
-from maude.domain.models import LocalAuditItem, LocalAuditResult
+from maude.domain.enums import QualityLevel, RefreshOutcome, RunStatus, TableKind
+from maude.domain.models import LocalAuditItem, LocalAuditResult, RefreshRunResult
 from maude.ingestion.manifests import load_manifest
 from maude.ingestion.pipeline import ingest_snapshot
+from maude.ingestion.refresh import refresh_fda
 from maude.quality.report import render_quality_markdown
 from maude.service.audit import audit_local_sources, blocking_findings, selected_archives
 from maude.storage.layout import SnapshotLayout
@@ -64,6 +65,35 @@ def _current_points_at_snapshot(layout: SnapshotLayout, snapshot_id: str) -> boo
     except (OSError, ValueError):
         return False
     return current.snapshot_id == snapshot_id and current.status is RunStatus.PROMOTED
+
+
+def _selected_counts(result: RefreshRunResult) -> str:
+    counts = {table: 0 for table in TableKind}
+    for stats in result.reconciliation:
+        counts[stats.table] += stats.inserted + stats.updated + stats.unchanged - stats.superseded
+    return ", ".join(f"{table.value}={counts[table]}" for table in TableKind)
+
+
+@app.command("refresh-fda")
+def refresh_fda_command() -> None:
+    """Download and publish the latest official FDA MAUDE current-year files."""
+    settings = Settings.model_validate({})
+    result = refresh_fda(settings)
+    if result.outcome in {RefreshOutcome.PROMOTED, RefreshOutcome.UNCHANGED}:
+        catalog_time = (
+            result.catalog.retrieved_at.isoformat() if result.catalog is not None else "unknown"
+        )
+        typer.echo(
+            f"{result.outcome.value.upper()} {result.snapshot_id or 'unknown'} "
+            f"catalog={catalog_time} selected: {_selected_counts(result)}"
+        )
+        return
+    failure = result.failure
+    phase = failure.phase if failure is not None else "unknown"
+    detail = "unknown failure" if failure is None else f"{failure.error_type}: {failure.message}"
+    evidence = settings.data_root / "refresh-runs" / f"{result.run_id}.json"
+    typer.echo(f"FAILED {phase} {detail} evidence={evidence}")
+    raise typer.Exit(1)
 
 
 @app.command("audit-local")
