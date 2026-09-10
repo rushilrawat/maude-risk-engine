@@ -13,13 +13,14 @@ def _write_role(path: Path, rows: list[dict[str, str]], schema: pa.Schema | None
     pq.write_table(table, path)
 
 
-def _master(key: str, value: str, role: SourceRole) -> dict[str, str]:
+def _master(key: str, value: str, role: SourceRole, line: str = "1") -> dict[str, str]:
     return {
         "mdr_report_key": key,
         "event_type": value,
         "record_content_hash": value,
         "_source_role": role.value,
         "_source_filename": f"mdrfoi{'' if role is SourceRole.BASE else role.value}.txt",
+        "_source_line_number": line,
     }
 
 
@@ -140,9 +141,10 @@ def test_reconcile_uses_each_table_business_key(
 
 def test_reconcile_rejects_duplicate_keys_within_one_role(tmp_path: Path) -> None:
     paths = {role: tmp_path / f"{role.value}.parquet" for role in SourceRole}
-    duplicate = _master("1", "duplicate", SourceRole.BASE)
-    schema = pa.Table.from_pylist([duplicate]).schema
-    _write_role(paths[SourceRole.BASE], [duplicate, duplicate], schema)
+    first = _master("1", "first", SourceRole.BASE, "1")
+    conflicting = _master("1", "conflicting", SourceRole.BASE, "2")
+    schema = pa.Table.from_pylist([first]).schema
+    _write_role(paths[SourceRole.BASE], [first, conflicting], schema)
     _write_role(paths[SourceRole.ADD], [], schema)
     _write_role(paths[SourceRole.CHANGE], [], schema)
     output = tmp_path / "current.parquet"
@@ -152,3 +154,61 @@ def test_reconcile_rejects_duplicate_keys_within_one_role(tmp_path: Path) -> Non
         reconcile_table(TableKind.MASTER, paths, output)
 
     assert output.read_bytes() == b"prior output"
+
+
+def test_reconcile_collapses_content_identical_duplicates(tmp_path: Path) -> None:
+    paths = {role: tmp_path / f"{role.value}.parquet" for role in SourceRole}
+    first = _master("1", "same", SourceRole.BASE, "10")
+    repeated = _master("1", "same", SourceRole.BASE, "11")
+    schema = pa.Table.from_pylist([first]).schema
+    _write_role(paths[SourceRole.BASE], [first, repeated], schema)
+    _write_role(paths[SourceRole.ADD], [], schema)
+    _write_role(paths[SourceRole.CHANGE], [], schema)
+    conflict_path = tmp_path / "conflicts.parquet"
+
+    stats = reconcile_table(
+        TableKind.MASTER,
+        paths,
+        tmp_path / "current.parquet",
+        conflict_path=conflict_path,
+    )
+
+    rows = pq.read_table(tmp_path / "current.parquet").to_pylist()
+    assert len(rows) == 1
+    assert rows[0]["_source_line_number"] == "10"
+    assert not conflict_path.exists()
+    base = next(item for item in stats if item.role is SourceRole.BASE)
+    assert base.duplicate_rows_collapsed == 1
+    assert base.conflicting_rows_quarantined == 0
+
+
+def test_reconcile_quarantines_all_conflicting_duplicate_rows(tmp_path: Path) -> None:
+    paths = {role: tmp_path / f"{role.value}.parquet" for role in SourceRole}
+    rows = [
+        _master("1", "first", SourceRole.CHANGE, "20"),
+        _master("1", "second", SourceRole.CHANGE, "21"),
+        _master("2", "selected", SourceRole.CHANGE, "22"),
+    ]
+    schema = pa.Table.from_pylist(rows).schema
+    _write_role(paths[SourceRole.BASE], [], schema)
+    _write_role(paths[SourceRole.ADD], [], schema)
+    _write_role(paths[SourceRole.CHANGE], rows, schema)
+    conflict_path = tmp_path / "conflicts.parquet"
+
+    stats = reconcile_table(
+        TableKind.MASTER,
+        paths,
+        tmp_path / "current.parquet",
+        conflict_path=conflict_path,
+    )
+
+    selected = pq.read_table(tmp_path / "current.parquet").to_pylist()
+    assert [row["mdr_report_key"] for row in selected] == ["2"]
+    conflicts = pq.read_table(conflict_path).to_pylist()
+    assert [(row["event_type"], row["_source_line_number"]) for row in conflicts] == [
+        ("first", "20"),
+        ("second", "21"),
+    ]
+    change = next(item for item in stats if item.role is SourceRole.CHANGE)
+    assert change.duplicate_rows_collapsed == 0
+    assert change.conflicting_rows_quarantined == 2

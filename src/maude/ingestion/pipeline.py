@@ -830,19 +830,36 @@ def ingest_role_snapshot(
                     parse_results.append(bronze.stats)
                     date_failures += normalized.date_parse_failure_count
                 active_phase = "reconcile"
-                reconciliation_stats.extend(
-                    reconcile_table(
-                        table,
-                        normalized_paths,
-                        layout.silver / f"{table.value}.parquet",
-                    )
+                conflict_path = layout.silver / "_conflicts" / f"{table.value}.parquet"
+                table_reconciliation = reconcile_table(
+                    table,
+                    normalized_paths,
+                    layout.silver / f"{table.value}.parquet",
+                    conflict_path=conflict_path,
                 )
+                reconciliation_stats.extend(table_reconciliation)
                 stats = ParseStats(
                     rows_seen=sum(result.rows_seen for result in parse_results),
                     rows_accepted=sum(result.rows_accepted for result in parse_results),
                     rows_rejected=sum(result.rows_rejected for result in parse_results),
                     columns=parse_results[0].columns,
                 )
+                table_quality = [_date_parse_quality(date_failures, stats.rows_accepted)]
+                conflicting_rows = sum(
+                    result.conflicting_rows_quarantined for result in table_reconciliation
+                )
+                if conflicting_rows:
+                    table_quality.append(
+                        QualityResult(
+                            check="reconciliation_conflicts",
+                            level=QualityLevel.WARNING,
+                            passed=False,
+                            message=(
+                                f"{conflicting_rows} conflicting source row(s) were quarantined"
+                            ),
+                            metrics={"quarantined_rows": conflicting_rows},
+                        )
+                    )
                 tables.append(
                     TableResult(
                         table=table,
@@ -852,7 +869,7 @@ def ingest_role_snapshot(
                         silver_path=str(layout.silver / f"{table.value}.parquet"),
                         reject_path=str(reject_root),
                         stats=stats,
-                        quality=(_date_parse_quality(date_failures, stats.rows_accepted),),
+                        quality=tuple(table_quality),
                     )
                 )
             active_phase = "quality"

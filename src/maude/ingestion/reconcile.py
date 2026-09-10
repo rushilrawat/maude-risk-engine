@@ -18,6 +18,9 @@ _PRIORITY = {
 }
 _INTERNAL_PRIORITY = "__maude_role_priority"
 _INTERNAL_RANK = "__maude_selection_rank"
+_INTERNAL_KEY_COUNT = "__maude_key_count"
+_INTERNAL_HASH_COUNT = "__maude_hash_count"
+_INTERNAL_ROLE_ROW = "__maude_role_row"
 
 
 class ReconciliationError(ValueError):
@@ -39,10 +42,10 @@ def _temporary_sibling(path: Path) -> Path:
     return Path(name)
 
 
-def _role_select(path: Path, role: SourceRole) -> str:
+def _role_select(relation: str, role: SourceRole) -> str:
     return (
         f"SELECT *, {_PRIORITY[role]} AS {_identifier(_INTERNAL_PRIORITY)} "
-        f"FROM read_parquet({_literal(path)})"
+        f"FROM {_identifier(relation)}"
     )
 
 
@@ -64,41 +67,99 @@ def _validate_inputs(
             raise ReconciliationError(
                 f"{role.value} input is missing required columns: {', '.join(missing)}"
             )
-        reserved = {_INTERNAL_PRIORITY, _INTERNAL_RANK} & columns
+        reserved = {
+            _INTERNAL_PRIORITY,
+            _INTERNAL_RANK,
+            _INTERNAL_KEY_COUNT,
+            _INTERNAL_HASH_COUNT,
+            _INTERNAL_ROLE_ROW,
+        } & columns
         if reserved:
             column = reserved.pop()
             raise ReconciliationError(f"input uses reserved reconciliation column: {column}")
     return validated
 
 
-def _reject_role_duplicates(
-    connection: Any, role: SourceRole, path: Path, keys: tuple[str, ...]
-) -> None:
+def _prepare_role(
+    connection: Any,
+    role: SourceRole,
+    path: Path,
+    keys: tuple[str, ...],
+    allow_conflicts: bool,
+) -> tuple[str, str, int, int]:
     key_list = ", ".join(_identifier(key) for key in keys)
-    row = connection.execute(
+    ranked = f"role_{role.value}_ranked"
+    selected = f"role_{role.value}"
+    connection.execute(
         " ".join(
             (
-                "SELECT COUNT(*)::BIGINT FROM (",
-                f"SELECT {key_list} FROM read_parquet({_literal(path)})",
-                f"GROUP BY {key_list} HAVING COUNT(*) > 1",
-                ") AS duplicate_keys",
+                f"CREATE TEMP VIEW {_identifier(ranked)} AS SELECT *,",
+                f"count(*) OVER (PARTITION BY {key_list}) AS",
+                f"{_identifier(_INTERNAL_KEY_COUNT)},",
+                f"count(DISTINCT record_content_hash) OVER (PARTITION BY {key_list}) AS",
+                f"{_identifier(_INTERNAL_HASH_COUNT)},",
+                f"row_number() OVER (PARTITION BY {key_list} ORDER BY file_row_number) AS",
+                f"{_identifier(_INTERNAL_ROLE_ROW)}",
+                f"FROM read_parquet({_literal(path)}, file_row_number = true)",
+            )
+        )
+    )
+    duplicate_row = connection.execute(
+        " ".join(
+            (
+                "SELECT coalesce(sum(",
+                f"{_identifier(_INTERNAL_KEY_COUNT)} - 1), 0)::BIGINT",
+                f"FROM {_identifier(ranked)}",
+                f"WHERE {_identifier(_INTERNAL_ROLE_ROW)} = 1",
+                f"AND {_identifier(_INTERNAL_HASH_COUNT)} = 1",
+                f"AND {_identifier(_INTERNAL_KEY_COUNT)} > 1",
             )
         )
     ).fetchone()
-    if row is None:
-        raise RuntimeError("DuckDB did not return duplicate-key count")
-    if int(row[0]):
-        raise ReconciliationError(
-            f"found {int(row[0])} duplicate business keys in {role.value} input"
+    conflict_row = connection.execute(
+        " ".join(
+            (
+                "SELECT count(*)::BIGINT,",
+                f"coalesce(sum({_identifier(_INTERNAL_KEY_COUNT)}), 0)::BIGINT",
+                f"FROM {_identifier(ranked)}",
+                f"WHERE {_identifier(_INTERNAL_ROLE_ROW)} = 1",
+                f"AND {_identifier(_INTERNAL_HASH_COUNT)} > 1",
+            )
         )
+    ).fetchone()
+    if duplicate_row is None or conflict_row is None:
+        raise RuntimeError("DuckDB did not return duplicate-key statistics")
+    conflict_groups = int(conflict_row[0])
+    conflicting_rows = int(conflict_row[1])
+    if conflict_groups and not allow_conflicts:
+        raise ReconciliationError(
+            f"found {conflict_groups} conflicting duplicate business keys in {role.value} input"
+        )
+    connection.execute(
+        " ".join(
+            (
+                f"CREATE TEMP VIEW {_identifier(selected)} AS SELECT * EXCLUDE (",
+                "file_row_number,",
+                f"{_identifier(_INTERNAL_KEY_COUNT)},",
+                f"{_identifier(_INTERNAL_HASH_COUNT)},",
+                f"{_identifier(_INTERNAL_ROLE_ROW)}",
+                f") FROM {_identifier(ranked)}",
+                f"WHERE {_identifier(_INTERNAL_HASH_COUNT)} = 1",
+                f"AND {_identifier(_INTERNAL_ROLE_ROW)} = 1",
+            )
+        )
+    )
+    return selected, ranked, int(duplicate_row[0]), conflicting_rows
 
 
 def _stats_for_role(
     connection: Any,
     table: TableKind,
     role: SourceRole,
-    path: Path,
+    relation: str,
     keys: tuple[str, ...],
+    duplicate_rows_collapsed: int,
+    conflicting_rows_quarantined: int,
 ) -> ReconciliationStats:
     priority = _PRIORITY[role]
     key_list = ", ".join(_identifier(key) for key in keys)
@@ -119,7 +180,7 @@ def _stats_for_role(
             f"SELECT {key_list}, {_identifier(_INTERNAL_PRIORITY)} AS selected_priority",
             "FROM selected_candidates",
             "), role_rows AS (",
-            f"SELECT * FROM read_parquet({_literal(path)})",
+            f"SELECT * FROM {_identifier(relation)}",
             ") SELECT",
             f"coalesce(count_if(lower_rows.{first_key} IS NULL), 0)::BIGINT AS inserted,",
             f"coalesce(count_if(lower_rows.{first_key} IS NOT NULL AND",
@@ -145,6 +206,8 @@ def _stats_for_role(
         updated=int(row[1]),
         unchanged=int(row[2]),
         superseded=int(row[3]),
+        duplicate_rows_collapsed=duplicate_rows_collapsed,
+        conflicting_rows_quarantined=conflicting_rows_quarantined,
     )
 
 
@@ -152,22 +215,33 @@ def reconcile_table(
     table: TableKind,
     role_paths: Mapping[SourceRole, Path],
     output_path: Path,
+    *,
+    conflict_path: Path | None = None,
 ) -> tuple[ReconciliationStats, ...]:
     """Select one current row per business key using change/add/base precedence."""
     keys = tuple(normalize_column(column) for column in spec_for(table).business_key)
     paths = _validate_inputs(role_paths, keys)
     output_path = Path(output_path)
     temporary = _temporary_sibling(output_path)
+    conflict_temporary: Path | None = None
     connection: Any | None = None
     try:
         temporary.unlink()
         with tempfile.TemporaryDirectory(prefix="maude-reconcile-") as spill_directory:
             connection = duckdb.connect()
             connection.execute(f"SET temp_directory = {_literal(spill_directory)}")
-            for role, path in paths.items():
-                _reject_role_duplicates(connection, role, path, keys)
+            prepared = {
+                role: _prepare_role(
+                    connection,
+                    role,
+                    path,
+                    keys,
+                    allow_conflicts=conflict_path is not None,
+                )
+                for role, path in paths.items()
+            }
             union = " UNION ALL BY NAME ".join(
-                _role_select(paths[role], role) for role in SourceRole
+                _role_select(prepared[role][0], role) for role in SourceRole
             )
             connection.execute(f"CREATE TEMP VIEW candidates AS {union}")
             key_list = ", ".join(_identifier(key) for key in keys)
@@ -184,8 +258,38 @@ def reconcile_table(
                 )
             )
             stats = tuple(
-                _stats_for_role(connection, table, role, paths[role], keys) for role in SourceRole
+                _stats_for_role(
+                    connection,
+                    table,
+                    role,
+                    prepared[role][0],
+                    keys,
+                    prepared[role][2],
+                    prepared[role][3],
+                )
+                for role in SourceRole
             )
+            if conflict_path is not None and any(item[3] for item in prepared.values()):
+                conflict_path = Path(conflict_path)
+                conflict_temporary = _temporary_sibling(conflict_path)
+                conflict_temporary.unlink()
+                conflicts = " UNION ALL BY NAME ".join(
+                    " ".join(
+                        (
+                            "SELECT * EXCLUDE (file_row_number,",
+                            f"{_identifier(_INTERNAL_KEY_COUNT)},",
+                            f"{_identifier(_INTERNAL_HASH_COUNT)},",
+                            f"{_identifier(_INTERNAL_ROLE_ROW)}),",
+                            "'conflicting_duplicate_business_key' AS _conflict_reason",
+                            f"FROM {_identifier(prepared[role][1])}",
+                            f"WHERE {_identifier(_INTERNAL_HASH_COUNT)} > 1",
+                        )
+                    )
+                    for role in SourceRole
+                )
+                connection.execute(
+                    f"COPY ({conflicts}) TO {_literal(conflict_temporary)} (FORMAT PARQUET)"
+                )
             connection.execute(
                 " ".join(
                     (
@@ -198,10 +302,15 @@ def reconcile_table(
             )
             connection.close()
             connection = None
+        if conflict_temporary is not None and conflict_path is not None:
+            conflict_temporary.replace(conflict_path)
+            conflict_temporary = None
         temporary.replace(output_path)
         return stats
     except BaseException:
         if connection is not None:
             connection.close()
         temporary.unlink(missing_ok=True)
+        if conflict_temporary is not None:
+            conflict_temporary.unlink(missing_ok=True)
         raise

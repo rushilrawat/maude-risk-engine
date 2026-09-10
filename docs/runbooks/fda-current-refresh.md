@@ -55,6 +55,13 @@ For each attempt, inspect:
   snapshot; and
 - `MAUDE_DATA_ROOT/silver/<snapshot-id>/` for the four current Parquet tables.
 
+When one source role repeats the same business key, content-identical repeats
+collapse to one row. Conflicting repeats are excluded before role precedence is
+applied, so a valid lower-precedence row remains selected. All conflicting rows
+and their source provenance are retained at
+`MAUDE_DATA_ROOT/silver/<snapshot-id>/_conflicts/<table>.parquet`, and the table
+manifest records a `reconciliation_conflicts` warning plus exact row counts.
+
 ## Safe retries
 
 The command is safe to rerun after a network or validation failure. It does not
