@@ -101,6 +101,8 @@ class ReconciliationStats(ContractModel):
     updated: int = Field(ge=0)
     unchanged: int = Field(ge=0)
     superseded: int = Field(ge=0)
+    duplicate_rows_collapsed: int = Field(default=0, ge=0)
+    conflicting_rows_quarantined: int = Field(default=0, ge=0)
 
 
 class RefreshFailure(ContractModel):

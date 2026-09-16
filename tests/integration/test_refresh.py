@@ -19,7 +19,7 @@ from maude.storage.layout import SnapshotLayout
 HEADERS = {
     TableKind.MASTER: "MDR_REPORT_KEY|DATE_RECEIVED|EVENT_TYPE",
     TableKind.DEVICE: "MDR_REPORT_KEY|DEVICE_SEQUENCE_NO|DEVICE_REPORT_PRODUCT_CODE",
-    TableKind.PATIENT: "MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER",
+    TableKind.PATIENT: "MDR_REPORT_KEY|PATIENT_SEQUENCE_NUMBER|PATIENT_AGE",
     TableKind.NARRATIVE: "MDR_REPORT_KEY|MDR_TEXT_KEY|TEXT_TYPE_CODE|FOI_TEXT",
 }
 
@@ -30,7 +30,7 @@ def _row(table: TableKind, key: str, value: str) -> str:
     if table is TableKind.DEVICE:
         return f"{key}|1|{value}"
     if table is TableKind.PATIENT:
-        return f"{key}|1"
+        return f"{key}|1|{value}"
     return f"{key}|{key}0|D|{value}"
 
 
@@ -246,3 +246,33 @@ def test_previously_seen_fingerprint_is_revalidated_and_republished(tmp_path: Pa
     assert restored.snapshot_id == first.snapshot_id
     current = load_manifest(settings.data_root / "manifests" / "current.json")
     assert current.snapshot_id == first.snapshot_id
+
+
+def test_refresh_promotes_with_conflicting_rows_quarantined(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    bodies = _source_bodies()
+    bodies["patientchange.zip"] = _zip(
+        "patientchange.txt",
+        TableKind.PATIENT,
+        [
+            _row(TableKind.PATIENT, "1", "10 YR"),
+            _row(TableKind.PATIENT, "1", "11 YR"),
+        ],
+    )
+
+    result = refresh_fda(settings, opener=_Opener(bodies))
+
+    assert result.outcome is RefreshOutcome.PROMOTED
+    assert result.snapshot_id is not None
+    layout = SnapshotLayout(settings.data_root, result.snapshot_id)
+    conflict_path = layout.promoted / "_conflicts" / "patient.parquet"
+    conflicts = pq.read_table(conflict_path).to_pylist()
+    assert [row["patient_age"] for row in conflicts] == ["10 YR", "11 YR"]
+    current = load_manifest(layout.current_manifest)
+    patient = next(table for table in current.tables if table.table is TableKind.PATIENT)
+    selected = pq.read_table(patient.silver_path).to_pylist()
+    retained = next(row for row in selected if row["mdr_report_key"] == "1")
+    assert retained["patient_age"] == "base"
+    warning = next(check for check in patient.quality if check.check == "reconciliation_conflicts")
+    assert not warning.passed
+    assert warning.metrics["quarantined_rows"] == 2
