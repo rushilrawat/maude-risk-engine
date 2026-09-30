@@ -205,7 +205,10 @@ system, not promises that they already exist.
 
 ### 5. [ ] Complete production corpus — **High**
 
-- Finish and document a clean end-to-end live refresh across every required table.
+- [x] Complete a live refresh of all four current-year table families; snapshot
+  `fda-current-43bedbf20c68c84b` was promoted with all 12 expected archive inputs.
+- Finish historical bootstrap and document a clean end-to-end refresh across the
+  expanded corpus.
 - Add historical annual files, device/patient problem codes, and controlled annual
   rollover reconciliation.
 - Add FDA device classification and recall context through separate, versioned
@@ -295,6 +298,10 @@ The complete product and scientific design is in
 [`FDA MAUDE Safety-Signal and Triage Platform Design`](docs/superpowers/specs/2026-09-04-fda-maude-signal-triage-design.md).
 The repository intentionally implements that design in independently verifiable
 vertical slices.
+
+New contributors can start with the [project guide](docs/PROJECT_GUIDE.md). The
+[issue backlog drafts](docs/ISSUE_BACKLOG.md) identify remaining work, dependencies,
+acceptance criteria, and the first files to inspect.
 
 ## ⚖️ Responsible use
 
