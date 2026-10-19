@@ -1,47 +1,56 @@
-# GitHub Issue Backlog Drafts
+# GitHub Issue Backlog and Implementation Status
 
-These are ready-to-post issue drafts for the remaining roadmap. GitHub currently
-shows zero issues for this repository and displays “Issue creation is restricted
-in this repository.” No issues have been created. Once issue creation is enabled,
-post these as separate issues and link each merged pull request to its issue.
+These entries document the planned work and its implementation state. GitHub
+currently shows zero issues for this repository and displays “Issue creation is
+restricted in this repository.” No issues have been created. Once issue creation
+is enabled, post the remaining items and link each merged pull request to its issue.
 
 Effort estimates are engineering complexity, not calendar time. File paths are
-repository-relative. The first item is the recommended next task.
+repository-relative. Issues 1 and 2 have local implementations; issue 3 now has
+an audit implementation but still needs review against the real snapshot and an
+explicit exclusion policy. GitHub issue creation remains restricted.
 
-## 1. Build source-linked report documents and narrative cleaning
+## 1. Build a reproducible modeling corpus from promoted snapshots
 
 **Effort:** High · **Roadmap:** Phase 6 — Narrative and feature engineering
+**Status:** Implemented on `feature/reconciliation-conflicts`.
 
 ### Goal
 
-Create a deterministic modeling representation for each FDA report while retaining
-the original narrative rows as independently inspectable evidence.
+Build on the implemented in-memory cleaning and report-document contracts to
+produce a reproducible corpus from a pinned promoted snapshot, while retaining
+original narrative rows as independently inspectable evidence. The existing
+contracts are in `src/maude/features/documents.py` and
+`src/maude/domain/models.py` (`ModelingNarrative`, `ModelingDocument`).
 
 ### Read first
 
 - `docs/PROJECT_GUIDE.md`, section “Next implementation stage: narrative features”
 - `docs/superpowers/specs/2026-09-04-fda-maude-signal-triage-design.md`, section 9
+- `src/maude/features/documents.py` (current in-memory cleaning/document step)
+- `src/maude/storage/layout.py` (managed data locations)
+- `src/maude/ingestion/manifests.py` (manifest conventions)
 - `src/maude/storage/duckdb.py` (`report_documents` view)
-- `src/maude/domain/models.py` (`ReportDocument`, `NarrativeEvidence`)
+- `src/maude/domain/models.py` (`ReportDocument`, `NarrativeEvidence`, modeling contracts)
 - `tests/integration/test_duckdb_views.py`
 
 ### Acceptance criteria
 
-- A stable report-document contract carries snapshot ID and relevant device/report
-  metadata, with narrative evidence rows retained by text key, type, source file,
-  and source line.
-- Deterministic cleaning normalizes Unicode and formatting without deleting
-  negations, measurements, device codes, or clinically meaningful punctuation.
-- Boilerplate masking affects only the modeling text; original evidence remains
-  retrievable unchanged.
-- Empty and duplicate narratives are handled explicitly and reproducibly.
-- Tests use small synthetic or appropriately de-identified fixtures only.
-- The output records a document/cleaning version and can be regenerated from its
-  pinned snapshot.
+- A bounded-memory builder reads a pinned, promoted snapshot and writes report-level
+  modeling documents outside Git.
+- A versioned run manifest records snapshot identity, cleaning version, and counts
+  of reports/narratives written or omitted (including blank narratives).
+- Each emitted narrative retains resolvable source evidence (text key, type, file,
+  source line, source hash, and snapshot provenance).
+- Rerunning the builder on the same snapshot and code version produces equivalent
+  records and manifest counts.
+- Tests use small synthetic or appropriately de-identified fixtures only; raw FDA
+  data and generated corpora are not committed.
 
 ## 2. Add a reproducible word and character TF-IDF baseline
 
 **Effort:** High · **Roadmap:** Phase 6 — Narrative and feature engineering
+**Status:** Implemented on `feature/reconciliation-conflicts`.
 
 ### Goal
 
@@ -63,13 +72,20 @@ clean report documents, without fitting vocabulary on held-out time periods.
 - Word and character n-gram baselines are separately reproducible.
 - Vectorizer parameters, vocabulary/model artifacts, dataset snapshot, feature
   version, and environment lock identity are recorded.
-- Feature generation is bounded-memory for the expected corpus scale.
+- Feature generation is bounded-memory: vocabularies fit from a deterministic,
+  capped training-only sample, then transform all periods in sparse matrix batches.
 - A small fixture proves deterministic output and prevents vocabulary leakage.
 - No raw corpus or generated model/vector files are committed.
+
+**Implementation:** `src/maude/features/tfidf.py`; CLI: `maude build-tfidf`.
+The shared split boundaries live in `src/maude/features/splits.py`. Review the
+duplicate audit from issue 3 before proceeding to clustering.
 
 ## 3. Build temporal train/validation/test splits and leakage checks
 
 **Effort:** High · **Roadmap:** Phase 7 — Clustering and statistical evaluation
+**Status:** Audit implementation complete and fixture-tested; full-snapshot audit
+has not completed. Split-exclusion policy and historical bootstrap remain open.
 
 ### Goal
 
@@ -91,6 +107,23 @@ duplicate narratives, and repeated source records from leaking into training.
 - Any cohort or date exclusions are reported with counts and reasons.
 - Tests prove the split is deterministic and leakage checks detect injected overlap.
 - An evaluation manifest records date windows, exclusions, and source snapshot.
+
+**Implemented slice:** `src/maude/features/splits.py` defines the shared, versioned
+2024/2025/2026+ boundaries. `src/maude/features/duplicates.py` adds a disk-backed
+audit of exact narrative groups, repeated report IDs across periods, and approximate
+near-duplicate pairs. Missing-date narratives are counted, results are checksum-
+bound, and no source records are modified or silently excluded. Near-duplicate
+candidate generation is approximate and reports its strategy/threshold; it is not
+an exhaustive proof that no near duplicate exists. A preliminary date-split count
+on `fda-current-43bedbf20c68c84b` found 30,279 training narratives, 34,430
+validation narratives, and 4,178,516 test narratives (2026-01-01 through
+2026-08-31). The highly skewed cohort requires historical bootstrap before model
+evaluation can be interpreted; the complete duplicate audit and findings review
+must also precede clustering. Two full audit attempts were stopped after about
+38 and 45 CPU minutes without publishing partial output; no full-snapshot
+duplicate counts are available. Add progress/resume support or optimize runtime,
+then rerun the immutable snapshot audit and review the resulting manifest before
+clustering.
 
 ## 4. Implement and evaluate failure-pattern clustering
 

@@ -226,6 +226,134 @@ class NarrativeEvidence(ContractModel):
     source_line_number: int
 
 
+class ModelingNarrative(ContractModel):
+    """Cleaned narrative text linked back to its immutable source evidence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    report_id: str
+    dataset_snapshot_id: str
+    evidence_id: str
+    text_type_code: str | None
+    source_filename: str
+    source_line_number: int = Field(ge=1)
+    source_text_sha256: str
+    modeling_text: str
+    cleaning_version: str
+
+
+class ModelingDocument(ContractModel):
+    """Report-level modeling text with independently traceable narrative segments."""
+
+    model_config = ConfigDict(frozen=True)
+
+    report_id: str
+    dataset_snapshot_id: str
+    reported_event_type: str | None
+    date_received: date | None
+    product_codes: tuple[str, ...]
+    brand_names: tuple[str, ...]
+    manufacturers: tuple[str, ...]
+    narratives: tuple[ModelingNarrative, ...]
+    modeling_text: str
+    cleaning_version: str
+
+
+class ModelingCorpusManifest(ContractModel):
+    """Counts and provenance for one immutable, locally built modeling corpus."""
+
+    corpus_format_version: str
+    cleaning_version: str
+    snapshot_id: str
+    promoted_snapshot_path: str
+    output_path: str
+    manifest_path: str
+    output_sha256: str
+    reports_seen: int = Field(ge=0)
+    documents_written: int = Field(ge=0)
+    narratives_written: int = Field(ge=0)
+    blank_narratives_omitted: int = Field(ge=0)
+    completed_at: datetime
+
+    @field_validator("completed_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("corpus completion timestamp must be timezone-aware")
+        return value
+
+
+class TfidfBaselineManifest(ContractModel):
+    """Training-only vocabulary, temporal partitions, and checksums for TF-IDF output."""
+
+    feature_version: str
+    snapshot_id: str
+    cleaning_version: str
+    output_directory: str
+    corpus_sha256: str
+    uv_lock_sha256: str
+    split_version: str | None = None
+    training_end: date
+    validation_start: date
+    validation_end: date
+    test_start: date
+    fit_sample_limit: int = Field(ge=1)
+    fit_sample_size: int = Field(ge=1)
+    fit_sample_report_ids_sha256: str
+    split_document_counts: Mapping[str, int]
+    matrix_shard_counts: Mapping[str, int]
+    missing_date_documents: int = Field(ge=0)
+    feature_dimensions: Mapping[str, int]
+    vectorizer_config: Mapping[str, object]
+    artifact_sha256: Mapping[str, str]
+    completed_at: datetime
+
+    @field_validator("completed_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("TF-IDF completion timestamp must be timezone-aware")
+        return value
+
+
+class DuplicateAuditManifest(ContractModel):
+    """Snapshot-bound exact and approximate cross-period narrative audit."""
+
+    audit_version: str
+    snapshot_id: str
+    cleaning_version: str
+    corpus_sha256: str
+    output_directory: str
+    split_version: str
+    training_end: date
+    validation_start: date
+    validation_end: date
+    test_start: date
+    narratives_scanned: int = Field(ge=0)
+    missing_date_narratives: int = Field(ge=0)
+    exact_duplicate_groups: int = Field(ge=0)
+    exact_cross_split_groups: int = Field(ge=0)
+    report_key_cross_split_groups: int = Field(ge=0)
+    near_cross_split_pairs: int = Field(ge=0)
+    near_candidate_overflow_documents: int = Field(ge=0)
+    near_candidate_strategy: str
+    near_similarity_threshold: float = Field(ge=0, le=1)
+    near_candidate_search_is_exhaustive: bool
+    exact_groups_path: str
+    exact_members_path: str
+    report_key_overlaps_path: str
+    near_pairs_path: str
+    artifact_sha256: Mapping[str, str]
+    completed_at: datetime
+
+    @field_validator("completed_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("duplicate-audit completion timestamp must be timezone-aware")
+        return value
+
+
 class ReportDocument(ContractModel):
     """Immutable report metadata and provenance-preserving narrative evidence."""
 

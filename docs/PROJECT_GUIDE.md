@@ -36,7 +36,8 @@ The current branch implements a strong ingestion foundation:
 - Exact duplicate collapse and evidence-preserving quarantine of conflicting
   duplicate keys.
 - Blocking quality checks, warning reports, and recoverable snapshot promotion.
-- CLI commands: `audit-local`, `ingest-local`, and `refresh-fda`.
+- CLI commands: `audit-local`, `ingest-local`, `refresh-fda`, `build-corpus`,
+  `build-tfidf`, and `audit-duplicates`.
 
 A real current-year refresh has been published locally as snapshot
 `fda-current-43bedbf20c68c84b`. Its manifest is under
@@ -47,9 +48,26 @@ should be carried into analysis; a promoted snapshot does not mean every row was
 accepted or every warning resolved. The refresh evidence is local operator data,
 not a repository fixture.
 
-The next analytical stage is narrative preparation and feature engineering. There
-is not yet an implemented TF-IDF/clustering model, signal score, evidence index,
-LangGraph workflow, API, web app, scheduled production deployment, or reviewer UI.
+The narrative and baseline-feature slices now include deterministic NFC and
+whitespace normalization, source-linked report documents, a bounded-memory corpus
+writer, and word/character TF-IDF matrices. Vocabulary is fitted only from a
+deterministic sample of reports received through 2024; 2025 is validation and 2026+
+is held out for testing. A disk-backed audit reports exact duplicate groups,
+repeated report IDs across periods, and approximate near-duplicate candidates;
+missing-date records are counted, and source rows are not silently moved or
+excluded. A preliminary count of snapshot
+`fda-current-43bedbf20c68c84b` found 30,279 training narratives, 34,430
+validation narratives, and 4,178,516 test narratives. The test period spans
+2026-01-01 through 2026-08-31, so this current-year snapshot is not a balanced
+historical training corpus; complete historical bootstrap is required before
+interpreting model evaluation or proceeding to clustering. The real-corpus
+duplicate-audit implementation is complete and fixture-tested. Two full runs
+over this snapshot were stopped after about 38 and 45 CPU minutes without
+publishing partial results; no full-snapshot duplicate counts are available yet.
+The audit needs better progress/resume behavior or further runtime optimization
+before its findings can be reviewed. Clustering, signal scores, evidence index,
+LangGraph workflow, API, web app, scheduled production deployment, and reviewer UI
+are not yet implemented.
 
 ## 3. Data flow and vocabulary
 
@@ -103,6 +121,15 @@ uv run maude ingest-local local-2025-06 --source-root /path/to/fda-archives
 
 # Discover and refresh the current official FDA files
 uv run maude refresh-fda
+
+# Build report-level modeling documents from a specific promoted snapshot
+uv run maude build-corpus fda-current-43bedbf20c68c84b
+
+# Fit TF-IDF and batch-transform the 2024 / 2025 / 2026+ periods
+uv run maude build-tfidf fda-current-43bedbf20c68c84b
+
+# Audit repeated report IDs and narrative duplicates across those periods
+uv run maude audit-duplicates fda-current-43bedbf20c68c84b
 ```
 
 The refresh command uses the configured `MAUDE_DATA_ROOT` and currently takes no
@@ -125,6 +152,7 @@ needs, output paths, failure recovery, and warnings.
 | Archive discovery and downloads | [`../src/maude/ingestion/fda_catalog.py`](../src/maude/ingestion/fda_catalog.py), [`../src/maude/ingestion/download.py`](../src/maude/ingestion/download.py), [`../src/maude/ingestion/http.py`](../src/maude/ingestion/http.py) |
 | Parse and normalize | [`../src/maude/ingestion/parser.py`](../src/maude/ingestion/parser.py), [`../src/maude/ingestion/normalize.py`](../src/maude/ingestion/normalize.py), [`../src/maude/ingestion/schemas.py`](../src/maude/ingestion/schemas.py) |
 | Reconciliation and orchestration | [`../src/maude/ingestion/reconcile.py`](../src/maude/ingestion/reconcile.py), [`../src/maude/ingestion/refresh.py`](../src/maude/ingestion/refresh.py), [`../src/maude/ingestion/pipeline.py`](../src/maude/ingestion/pipeline.py) |
+| Narrative features, fixed splits, and leakage audit | [`../src/maude/features/documents.py`](../src/maude/features/documents.py), [`../src/maude/features/tfidf.py`](../src/maude/features/tfidf.py), [`../src/maude/features/splits.py`](../src/maude/features/splits.py), [`../src/maude/features/duplicates.py`](../src/maude/features/duplicates.py) |
 | Quality and manifests | [`../src/maude/quality/checks.py`](../src/maude/quality/checks.py), [`../src/maude/quality/report.py`](../src/maude/quality/report.py), [`../src/maude/ingestion/manifests.py`](../src/maude/ingestion/manifests.py) |
 | Snapshot paths and query views | [`../src/maude/storage/layout.py`](../src/maude/storage/layout.py), [`../src/maude/storage/duckdb.py`](../src/maude/storage/duckdb.py) |
 | Verification commands | [`../Makefile`](../Makefile), [`../pyproject.toml`](../pyproject.toml), [`../tests/`](../tests/) |
@@ -144,17 +172,13 @@ in section 9 of the design spec.
 
 Recommended sequence:
 
-1. Define a stable report-document record and cleaning rules that preserve
-   negations, measurements, device codes, and source text.
-2. Build a deterministic narrative cleaning and document-construction step,
-   retaining `mdr_text_key`, text type, file, line, and snapshot provenance.
-3. Add small, de-identified or synthetic fixtures for punctuation, Unicode,
-   boilerplate, repeated narratives, and conflicting evidence. Do not commit raw
-   FDA data or generated corpora.
-4. Add a versioned word and character TF-IDF baseline. Fit preprocessing and
-   vocabulary only on training data.
-5. Evaluate feature behavior and cohort choices before adding clustering.
-6. Implement clustering and time-based evaluation as separate versions after the
+1. Extend fixtures for boilerplate, repeated narratives, and conflicting
+   evidence. Do not commit raw FDA data or generated corpora.
+2. Run `maude audit-duplicates <snapshot-id>` and review exact/near-duplicate
+   groups and report-key overlaps across fixed time windows before model
+   comparison. Near-duplicate candidates are approximate, not exhaustive.
+3. Evaluate feature behavior and cohort choices before adding clustering.
+4. Implement clustering and time-based evaluation as separate versions after the
    baseline document/feature outputs are stable.
 
 Read the matching issue in [`ISSUE_BACKLOG.md`](ISSUE_BACKLOG.md) before taking a

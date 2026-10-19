@@ -103,6 +103,12 @@ select evidence silently, infer causality, or finalize a case.
   snapshot.
 - Preserves manifests, rejects, reconciliation counts, and recovery information.
 - Supports safe retries and keeps the last validated snapshot live after failure.
+- Builds deterministic, source-linked report-level modeling text with NFC/whitespace
+  normalization while preserving original narrative evidence.
+- Builds a bounded-memory corpus from a pinned promoted snapshot and records a
+  versioned manifest with output checksum and written/omitted counts.
+- Fits reproducible word and character TF-IDF vocabularies from training-period
+  reports only, then writes checksummed, batched sparse matrices for each period.
 
 ## 🚀 Quickstart
 
@@ -135,6 +141,38 @@ files:
 ```bash
 uv run maude refresh-fda
 ```
+
+Build a narrative corpus from an already promoted snapshot:
+
+```bash
+uv run maude build-corpus fda-current-43bedbf20c68c84b
+```
+
+The corpus is written under `MAUDE_DATA_ROOT/corpora/` and keyed by snapshot and
+cleaning version. Existing corpus outputs are verified by checksum and reused.
+
+Fit the TF-IDF baseline from that corpus:
+
+```bash
+uv run maude build-tfidf fda-current-43bedbf20c68c84b
+```
+
+The initial research split is training through 2024, validation on 2025, and test
+from 2026 onward. Vocabulary is fitted on a deterministic, capped sample from the
+training period only; generated vectorizers and sparse matrices stay under
+`MAUDE_DATA_ROOT/features/`.
+
+Audit temporal leakage candidates from the same corpus:
+
+```bash
+uv run maude audit-duplicates fda-current-43bedbf20c68c84b
+```
+
+The checksum-bound report counts undated narratives, lists exact duplicate groups,
+repeated report IDs across periods, and verifies approximate near-duplicate
+candidates. Near-candidate search is explicitly non-exhaustive; results flag items
+for review and do not modify or exclude source records. Audit outputs stay under
+`MAUDE_DATA_ROOT/audits/`.
 
 Operational details live in the
 [`local ingestion`](docs/runbooks/local-ingestion.md) and
@@ -217,12 +255,16 @@ system, not promises that they already exist.
 
 ### 6. [ ] Narrative and feature engineering — **High**
 
-- Construct one evidence-linked document per report while preserving narrative-row
-  boundaries and text types.
+- [x] Add deterministic NFC/whitespace cleaning and an in-memory report-level
+  modeling document with source-linked narrative segments.
+- [x] Build a bounded-memory snapshot-to-corpus writer with versioned manifests and
+  counts for omitted blank narratives.
+- [x] Fit separate word and character TF-IDF baselines using training-only
+  vocabularies and time-based transform splits.
+- [x] Audit exact duplicate groups, repeated report IDs, and approximate
+  near-duplicate candidates across the fixed temporal splits.
 - Mask repeated regulatory boilerplate only in modeling representations.
-- Track exact and near-duplicate narratives so repeated submissions cannot dominate
-  evaluation unnoticed.
-- Build word and character TF-IDF plus frequency, reported-severity, novelty,
+- Build frequency, reported-severity, novelty,
   confidence, and report-volume-change features.
 
 ### 7. [ ] Clustering and statistical evaluation — **XHigh**
