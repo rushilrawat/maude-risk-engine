@@ -53,21 +53,28 @@ whitespace normalization, source-linked report documents, a bounded-memory corpu
 writer, and word/character TF-IDF matrices. Vocabulary is fitted only from a
 deterministic sample of reports received through 2024; 2025 is validation and 2026+
 is held out for testing. A disk-backed audit reports exact duplicate groups,
-repeated report IDs across periods, and approximate near-duplicate candidates;
-missing-date records are counted, and source rows are not silently moved or
-excluded. A preliminary count of snapshot
+repeated report IDs across periods, and exhaustive cross-split pairs with Jaccard
+similarity at least 0.8 over the existing unique word-trigram hash sets; this is
+text similarity, not clinical-event equivalence. Missing-date records are
+counted, and source rows are not silently moved or excluded. V2 publishes to a
+separate immutable directory and preserves the v1 artifacts. A preliminary count of snapshot
 `fda-current-43bedbf20c68c84b` found 30,279 training narratives, 34,430
 validation narratives, and 4,178,516 test narratives. The test period spans
 2026-01-01 through 2026-08-31, so this current-year snapshot is not a balanced
 historical training corpus; complete historical bootstrap is required before
-interpreting model evaluation or proceeding to clustering. The real-corpus
-duplicate-audit implementation is complete and fixture-tested. Two full runs
-over this snapshot were stopped after about 38 and 45 CPU minutes without
-publishing partial results; no full-snapshot duplicate counts are available yet.
-The audit needs better progress/resume behavior or further runtime optimization
-before its findings can be reviewed. Clustering, signal scores, evidence index,
-LangGraph workflow, API, web app, scheduled production deployment, and reviewer UI
-are not yet implemented.
+interpreting model evaluation or proceeding to clustering. The exact v2 join is
+implemented and fixture-verified, including an uncapped 251-match regression;
+`make verify` passes. Its pinned full-snapshot run stopped at the ranked-postings
+index because the projected next write would breach the 10 GiB free-space
+reserve. A later run built a large staging index but did not complete or publish
+v2; its staging was removed after confirming no process held it open. The v1
+artifact hashes remain unchanged, and no full-snapshot v2 counts or findings are
+available.
+Full-snapshot acceptance needs a successful run and immutable reopen/checksum
+verification. Clustering must wait for the completed audit and a recorded
+split-exclusion policy. Signal scores, evidence index, LangGraph workflow, API,
+web app, scheduled production deployment, and reviewer UI are not yet
+implemented.
 
 ## 3. Data flow and vocabulary
 
@@ -174,9 +181,12 @@ Recommended sequence:
 
 1. Extend fixtures for boilerplate, repeated narratives, and conflicting
    evidence. Do not commit raw FDA data or generated corpora.
-2. Run `maude audit-duplicates <snapshot-id>` and review exact/near-duplicate
+2. Complete `maude audit-duplicates <snapshot-id>` and review exact/near-duplicate
    groups and report-key overlaps across fixed time windows before model
-   comparison. Near-duplicate candidates are approximate, not exhaustive.
+   comparison. V2 is exhaustive for Jaccard similarity over the existing
+   word-trigram hash representation, subject to its configured temporal rules;
+   it does not establish clinical-event equivalence. The pinned full-snapshot
+   run remains outstanding because its exact disk index hit the 10 GiB reserve.
 3. Evaluate feature behavior and cohort choices before adding clustering.
 4. Implement clustering and time-based evaluation as separate versions after the
    baseline document/feature outputs are stable.

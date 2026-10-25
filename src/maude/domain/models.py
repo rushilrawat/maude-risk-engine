@@ -317,9 +317,10 @@ class TfidfBaselineManifest(ContractModel):
 
 
 class DuplicateAuditManifest(ContractModel):
-    """Snapshot-bound exact and approximate cross-period narrative audit."""
+    """Snapshot-bound exact and similarity-based cross-period narrative audit."""
 
     audit_version: str
+    algorithm_version: str = "legacy-v1"
     snapshot_id: str
     cleaning_version: str
     corpus_sha256: str

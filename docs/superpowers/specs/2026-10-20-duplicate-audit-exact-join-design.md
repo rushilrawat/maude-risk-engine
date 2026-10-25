@@ -25,12 +25,17 @@ The result must be reproducible, source-linked, and explicit about completion.
 ## Design
 
 - Use a proven exact set-similarity join (PPJoin-style) over each narrative's
-  unique word-trigram set: a deterministic global token order (document
-  frequency ascending, hash ascending for ties), prefix filtering, length
-  bounds, positional pruning where applicable, and exact Jaccard verification.
-  The implementation must correctly handle temporal pair direction even when
-  the later-split narrative has fewer shingles than its prior-split candidate.
-  Candidate generation must not silently discard matches due to a fixed cap.
+  unique word-trigram set: a deterministic total token order (document
+  frequency in the eligible prior-split candidate corpus ascending, hash
+  ascending for ties), prefix filtering, length bounds, positional pruning where
+  applicable, and exact Jaccard verification. A target token absent from the
+  prior-split corpus has frequency zero and is ordered by hash; it still counts
+  toward the target's prefix position. Materialize postings only for training
+  and validation candidates, and process future target shingles and candidate
+  joins in bounded batches. The implementation must correctly handle temporal
+  pair direction even when the later-split narrative has fewer shingles than
+  its prior-split candidate. Candidate generation must not silently discard
+  matches due to a fixed cap.
 - Preserve temporal direction: validation narratives compare with training;
   test narratives compare with training and validation. Do not compare records
   from the same report or identical normalized-text hash as near duplicates.

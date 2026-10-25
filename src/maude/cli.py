@@ -7,7 +7,7 @@ from maude.config import Settings
 from maude.domain.enums import QualityLevel, RefreshOutcome, RunStatus, TableKind
 from maude.domain.models import LocalAuditItem, LocalAuditResult, RefreshRunResult
 from maude.features.corpus import build_modeling_corpus
-from maude.features.duplicates import build_duplicate_audit
+from maude.features.duplicates import InsufficientDiskSpaceError, build_duplicate_audit
 from maude.features.tfidf import build_tfidf_baseline
 from maude.ingestion.manifests import load_manifest
 from maude.ingestion.pipeline import ingest_snapshot
@@ -154,7 +154,11 @@ def audit_duplicates(
 ) -> None:
     """Report exact and near-duplicate narratives across the fixed time splits."""
     settings = Settings.model_validate({}) if data_root is None else Settings(data_root=data_root)
-    result = build_duplicate_audit(settings.data_root, snapshot_id)
+    try:
+        result = build_duplicate_audit(settings.data_root, snapshot_id)
+    except InsufficientDiskSpaceError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=2) from error
     typer.echo(
         f"AUDITED {result.snapshot_id} narratives={result.narratives_scanned} "
         f"exact_cross_split={result.exact_cross_split_groups} "

@@ -84,8 +84,9 @@ duplicate audit from issue 3 before proceeding to clustering.
 ## 3. Build temporal train/validation/test splits and leakage checks
 
 **Effort:** High · **Roadmap:** Phase 7 — Clustering and statistical evaluation
-**Status:** Audit implementation complete and fixture-tested; full-snapshot audit
-has not completed. Split-exclusion policy and historical bootstrap remain open.
+**Status:** Exact v2 audit implementation and fixture suite complete; the pinned
+full-snapshot audit stopped at the disk-space reserve. Split-exclusion policy and
+historical bootstrap remain open.
 
 ### Goal
 
@@ -110,20 +111,25 @@ duplicate narratives, and repeated source records from leaking into training.
 
 **Implemented slice:** `src/maude/features/splits.py` defines the shared, versioned
 2024/2025/2026+ boundaries. `src/maude/features/duplicates.py` adds a disk-backed
-audit of exact narrative groups, repeated report IDs across periods, and approximate
-near-duplicate pairs. Missing-date narratives are counted, results are checksum-
-bound, and no source records are modified or silently excluded. Near-duplicate
-candidate generation is approximate and reports its strategy/threshold; it is not
-an exhaustive proof that no near duplicate exists. A preliminary date-split count
+audit of exact narrative groups, repeated report IDs across periods, and exhaustive
+near-duplicate pairs at Jaccard >= 0.8 over the existing unique word-trigram hash
+sets. This is exhaustive for that representation and configured temporal rules,
+not proof of clinical-event equivalence. Missing-date narratives are counted,
+results are checksum-bound, and no source records are modified or silently
+excluded. V2 writes to a separate immutable directory and leaves v1 artifacts
+unchanged. A preliminary date-split count
 on `fda-current-43bedbf20c68c84b` found 30,279 training narratives, 34,430
 validation narratives, and 4,178,516 test narratives (2026-01-01 through
 2026-08-31). The highly skewed cohort requires historical bootstrap before model
 evaluation can be interpreted; the complete duplicate audit and findings review
-must also precede clustering. Two full audit attempts were stopped after about
-38 and 45 CPU minutes without publishing partial output; no full-snapshot
-duplicate counts are available. Add progress/resume support or optimize runtime,
-then rerun the immutable snapshot audit and review the resulting manifest before
-clustering.
+must also precede clustering. Exact v2 join behavior, including an uncapped
+251-match regression, is fixture-tested, and `make verify` passes. A pinned
+full-snapshot attempt stopped at `ranked-postings-index`: the projected next write
+would breach the 10 GiB free-space reserve. A later run built a large staging
+index but did not complete or publish v2; its staging was removed after confirming
+no process held it open. No full-snapshot v2 counts are available, and v1 artifact
+hashes remain unchanged. Complete acceptance needs a successful run, immutable
+reopen/checksum verification, and findings review before clustering.
 
 ## 4. Implement and evaluate failure-pattern clustering
 

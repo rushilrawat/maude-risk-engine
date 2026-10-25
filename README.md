@@ -168,11 +168,14 @@ Audit temporal leakage candidates from the same corpus:
 uv run maude audit-duplicates fda-current-43bedbf20c68c84b
 ```
 
-The checksum-bound report counts undated narratives, lists exact duplicate groups,
-repeated report IDs across periods, and verifies approximate near-duplicate
-candidates. Near-candidate search is explicitly non-exhaustive; results flag items
-for review and do not modify or exclude source records. Audit outputs stay under
-`MAUDE_DATA_ROOT/audits/`.
+The checksum-bound v2 report counts undated narratives, lists exact duplicate
+groups and repeated report IDs across periods, and finds every cross-split pair
+with Jaccard similarity at least 0.8 over the existing unique word-trigram hash
+sets. Search is exhaustive for that representation and the configured temporal
+rules; it does not establish that narratives describe the same clinical event.
+V2 writes to a separate immutable directory and leaves v1 artifacts untouched.
+The audit preserves a 10 GiB free-space reserve and publishes nothing on a
+guarded stop. Audit outputs stay under `MAUDE_DATA_ROOT/audits/`.
 
 Operational details live in the
 [`local ingestion`](docs/runbooks/local-ingestion.md) and

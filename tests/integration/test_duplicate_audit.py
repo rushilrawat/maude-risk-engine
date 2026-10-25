@@ -1,8 +1,10 @@
 import hashlib
 import json
 import sqlite3
+from contextlib import suppress
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,18 +38,19 @@ def _document(report_id: str, received: date | None, text: str) -> ModelingDocum
     )
 
 
-def _write_corpus(data_root: Path) -> Path:
-    near_duplicate = " ".join(f"token{number}" for number in range(40))
-    altered_near_duplicate = near_duplicate.replace("token20", "changed20")
-    documents = (
-        _document("train-exact", date(2024, 12, 31), "Pump stalled and caused injury"),
-        _document("validation-exact", date(2025, 1, 1), "Pump stalled and caused injury"),
-        _document("train-near", date(2024, 6, 1), near_duplicate),
-        _document("validation-near", date(2025, 6, 1), altered_near_duplicate),
-        _document("repeated-key", date(2024, 4, 1), "Earlier conflicting report record"),
-        _document("repeated-key", date(2025, 4, 1), "Later conflicting report record"),
-        _document("undated", None, "Narrative without a received date"),
-    )
+def _write_corpus(data_root: Path, documents: tuple[ModelingDocument, ...] | None = None) -> Path:
+    if documents is None:
+        near_duplicate = " ".join(f"token{number}" for number in range(40))
+        altered_near_duplicate = near_duplicate.replace("token20", "changed20")
+        documents = (
+            _document("train-exact", date(2024, 12, 31), "Pump stalled and caused injury"),
+            _document("validation-exact", date(2025, 1, 1), "Pump stalled and caused injury"),
+            _document("train-near", date(2024, 6, 1), near_duplicate),
+            _document("validation-near", date(2025, 6, 1), altered_near_duplicate),
+            _document("repeated-key", date(2024, 4, 1), "Earlier conflicting report record"),
+            _document("repeated-key", date(2025, 4, 1), "Later conflicting report record"),
+            _document("undated", None, "Narrative without a received date"),
+        )
     corpus_dir = data_root / "corpora" / "fixture-2026" / "nfc-whitespace-v1"
     corpus_dir.mkdir(parents=True)
     output_path = corpus_dir / "documents.jsonl"
@@ -74,62 +77,19 @@ def _write_corpus(data_root: Path) -> Path:
     return output_path
 
 
-def test_audit_skips_candidate_search_for_training_documents(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import maude.features.duplicates as duplicates
+def _patch_disk_usage(monkeypatch: pytest.MonkeyPatch, free_bytes: list[int]) -> None:
+    import shutil
 
-    corpus_path = tmp_path / "documents.jsonl"
-    documents = (
-        _document("train-1", date(2024, 1, 1), "Pump stopped during use"),
-        _document("train-2", date(2024, 2, 1), "Pump stalled during use"),
-        _document("validation-1", date(2025, 1, 1), "Pump stopped during use"),
-    )
-    corpus_path.write_text("".join(f"{item.model_dump_json()}\n" for item in documents))
-    searched_splits: list[str] = []
+    remaining = iter(free_bytes)
+    last_free = free_bytes[-1]
 
-    def record_candidate_search(postings_by_split, candidate_narratives, candidates_for, split):
-        searched_splits.append(split)
-        return [], False
+    def fake_disk_usage(path: str | Path) -> SimpleNamespace:
+        nonlocal last_free
+        with suppress(StopIteration):
+            last_free = next(remaining)
+        return SimpleNamespace(total=100 * 1024**3, used=100 * 1024**3 - last_free, free=last_free)
 
-    monkeypatch.setattr(duplicates, "_candidate_records", record_candidate_search)
-    connection = sqlite3.connect(":memory:")
-    try:
-        duplicates._index_schema(connection)
-        duplicates._index_corpus(connection, corpus_path, "fixture-2026", "nfc-whitespace-v1")
-    finally:
-        connection.close()
-
-    assert searched_splits == ["validation"]
-
-
-def test_audit_does_not_unpack_narratives_without_candidates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import maude.features.duplicates as duplicates
-
-    corpus_path = tmp_path / "documents.jsonl"
-    documents = (
-        _document("train-1", date(2024, 1, 1), "alpha beta gamma delta"),
-        _document("validation-1", date(2025, 1, 1), "one two three four"),
-    )
-    corpus_path.write_text("".join(f"{item.model_dump_json()}\n" for item in documents))
-    unpacked: list[bytes] = []
-    original_unpack = duplicates._unpack_shingles
-
-    def record_unpack(packed: bytes) -> tuple[int, ...]:
-        unpacked.append(packed)
-        return original_unpack(packed)
-
-    monkeypatch.setattr(duplicates, "_unpack_shingles", record_unpack)
-    connection = sqlite3.connect(":memory:")
-    try:
-        duplicates._index_schema(connection)
-        duplicates._index_corpus(connection, corpus_path, "fixture-2026", "nfc-whitespace-v1")
-    finally:
-        connection.close()
-
-    assert unpacked == []
+    monkeypatch.setattr(shutil, "disk_usage", fake_disk_usage)
 
 
 def test_audit_batches_narrative_index_inserts(
@@ -185,7 +145,9 @@ def test_audit_flags_exact_and_near_duplicates_across_temporal_splits(
     assert manifest.exact_cross_split_groups == 1
     assert manifest.report_key_cross_split_groups == 1
     assert manifest.near_cross_split_pairs == 1
-    assert manifest.near_candidate_search_is_exhaustive is False
+    assert manifest.algorithm_version == "sqlite-ppjoin-jaccard-v1"
+    assert manifest.near_candidate_overflow_documents == 0
+    assert manifest.near_candidate_search_is_exhaustive is True
     exact_groups = [
         json.loads(line) for line in Path(manifest.exact_groups_path).read_text().splitlines()
     ]
@@ -224,12 +186,37 @@ def test_audit_flags_exact_and_near_duplicates_across_temporal_splits(
     ]
 
 
+def test_v2_audit_has_no_fixed_near_candidate_cap(tmp_path: Path) -> None:
+    from maude.features.duplicates import build_duplicate_audit
+
+    common_text = " ".join(f"shared{number}" for number in range(50))
+    documents = (
+        *(
+            _document(f"train-{index:03}", date(2024, 6, 1), f"{common_text} unique{index}")
+            for index in range(251)
+        ),
+        _document("validation-target", date(2025, 6, 1), f"{common_text} target"),
+    )
+    _write_corpus(tmp_path, documents)
+
+    manifest = build_duplicate_audit(tmp_path, "fixture-2026")
+
+    near_pairs = Path(manifest.near_pairs_path).read_text(encoding="utf-8").splitlines()
+    assert len(near_pairs) == 251
+    assert manifest.near_cross_split_pairs == 251
+    assert manifest.near_candidate_overflow_documents == 0
+    assert manifest.near_candidate_search_is_exhaustive is True
+
+
 def test_audit_finds_near_duplicates_when_corpus_order_reverses_temporal_order(
     tmp_path: Path,
 ) -> None:
     from maude.features.duplicates import build_duplicate_audit
 
-    corpus_path = _write_corpus(tmp_path)
+    forward_root = tmp_path / "forward"
+    reverse_root = tmp_path / "reverse"
+    _write_corpus(forward_root)
+    corpus_path = _write_corpus(reverse_root)
     documents = [
         ModelingDocument.model_validate_json(line)
         for line in corpus_path.read_text(encoding="utf-8").splitlines()
@@ -244,9 +231,13 @@ def test_audit_finds_near_duplicates_when_corpus_order_reverses_temporal_order(
         manifest.model_copy(update={"output_sha256": hashlib.sha256(payload).hexdigest()}),
     )
 
-    result = build_duplicate_audit(tmp_path, "fixture-2026")
+    forward = build_duplicate_audit(forward_root, "fixture-2026")
+    result = build_duplicate_audit(reverse_root, "fixture-2026")
 
     assert result.near_cross_split_pairs == 1
+    assert Path(forward.near_pairs_path).read_text(encoding="utf-8") == Path(
+        result.near_pairs_path
+    ).read_text(encoding="utf-8")
     near_pairs = [
         json.loads(line) for line in Path(result.near_pairs_path).read_text().splitlines()
     ]
@@ -256,11 +247,22 @@ def test_audit_finds_near_duplicates_when_corpus_order_reverses_temporal_order(
     assert near_pairs[0]["right_split"] == "validation"
 
 
-def test_audit_is_immutable_and_rejects_modified_results(tmp_path: Path) -> None:
+def test_audit_is_immutable_and_rejects_modified_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import maude.features.duplicates as duplicates
     from maude.features.duplicates import build_duplicate_audit
 
     _write_corpus(tmp_path)
     first = build_duplicate_audit(tmp_path, "fixture-2026")
+    assert first.audit_version == "narrative-duplicate-audit-v2"
+    assert first.algorithm_version == "sqlite-ppjoin-jaccard-v1"
+
+    def unexpected_rebuild(connection: sqlite3.Connection) -> int:
+        pytest.fail("an immutable v2 audit must be reopened without rerunning the join")
+
+    monkeypatch.setattr(duplicates, "_run_exact_similarity_join", unexpected_rebuild)
     second = build_duplicate_audit(tmp_path, "fixture-2026")
 
     assert second.model_dump() == first.model_dump()
@@ -268,6 +270,116 @@ def test_audit_is_immutable_and_rejects_modified_results(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="checksum"):
         build_duplicate_audit(tmp_path, "fixture-2026")
+
+
+def test_default_duplicate_audit_publishes_v2(tmp_path: Path) -> None:
+    from maude.features.duplicates import build_duplicate_audit
+
+    _write_corpus(tmp_path)
+
+    manifest = build_duplicate_audit(tmp_path, "fixture-2026")
+
+    assert manifest.audit_version == "narrative-duplicate-audit-v2"
+    assert Path(manifest.output_directory).name == "narrative-duplicate-audit-v2"
+
+
+def test_v2_audit_is_exhaustive_and_leaves_v1_directory_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import maude.features.duplicates as duplicates
+    from maude.features.duplicates import build_duplicate_audit
+
+    _write_corpus(tmp_path)
+    monkeypatch.setattr(duplicates, "DUPLICATE_AUDIT_VERSION", "narrative-duplicate-audit-v1")
+    legacy = build_duplicate_audit(tmp_path, "fixture-2026")
+    sentinel = Path(legacy.output_directory) / "preserve.txt"
+    sentinel.write_text("immutable v1 artifact", encoding="utf-8")
+
+    monkeypatch.setattr(duplicates, "DUPLICATE_AUDIT_VERSION", "narrative-duplicate-audit-v2")
+    manifest = build_duplicate_audit(tmp_path, "fixture-2026")
+
+    assert manifest.audit_version == "narrative-duplicate-audit-v2"
+    assert manifest.algorithm_version == "sqlite-ppjoin-jaccard-v1"
+    assert manifest.near_candidate_search_is_exhaustive is True
+    assert manifest.near_candidate_overflow_documents == 0
+    assert sentinel.read_text(encoding="utf-8") == "immutable v1 artifact"
+
+
+def test_audit_stops_at_preflight_without_publishing_or_staging(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from maude.features.duplicates import build_duplicate_audit
+
+    _write_corpus(tmp_path)
+    minimum_free = 10 * 1024**3
+    _patch_disk_usage(monkeypatch, [minimum_free - 1])
+
+    with pytest.raises(RuntimeError, match="phase=preflight") as error:
+        build_duplicate_audit(tmp_path, "fixture-2026")
+
+    assert "last_completed_phase=preflight" in str(error.value)
+    assert f"minimum_free_bytes={minimum_free - 1}" in str(error.value)
+    output_parent = tmp_path / "audits" / "fixture-2026"
+    assert not (output_parent / "narrative-duplicate-audit-v2").exists()
+    assert list(output_parent.glob(".duplicate-audit-*")) == []
+
+
+def test_audit_cleans_staging_when_disk_guard_stops_mid_run(tmp_path: Path, monkeypatch) -> None:
+    import maude.features.duplicates as duplicates
+    from maude.features.duplicates import build_duplicate_audit
+
+    _write_corpus(tmp_path)
+    minimum_free = 10 * 1024**3
+    _patch_disk_usage(
+        monkeypatch,
+        [100 * 1024**3, 100 * 1024**3, 100 * 1024**3, minimum_free - 1],
+    )
+    monkeypatch.setattr(duplicates, "_INDEX_BATCH_SIZE", 1)
+    flushed_batch_sizes: list[int] = []
+    flush_batch = duplicates._flush_index_batch
+
+    def record_flush(
+        connection: sqlite3.Connection,
+        narratives: list[tuple[int, str, str, str | None, str | None, str, bytes]],
+        disk_guard: duplicates._DiskSpaceGuard | None = None,
+    ) -> None:
+        batch_size = len(narratives)
+        flush_batch(connection, narratives, disk_guard)
+        flushed_batch_sizes.append(batch_size)
+
+    monkeypatch.setattr(duplicates, "_flush_index_batch", record_flush)
+
+    with pytest.raises(RuntimeError, match="phase=corpus-index") as error:
+        build_duplicate_audit(tmp_path, "fixture-2026")
+
+    assert "phase=corpus-index" in str(error.value)
+    assert "last_completed_phase=corpus-index" in str(error.value)
+    assert f"minimum_free_bytes={minimum_free - 1}" in str(error.value)
+    assert flushed_batch_sizes == [1]
+    output_parent = tmp_path / "audits" / "fixture-2026"
+    assert not (output_parent / "narrative-duplicate-audit-v2").exists()
+    assert list(output_parent.glob(".duplicate-audit-*")) == []
+
+
+def test_audit_cli_reports_disk_guard_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from maude.cli import app
+
+    _write_corpus(tmp_path)
+    _patch_disk_usage(monkeypatch, [10 * 1024**3 - 1])
+
+    result = CliRunner().invoke(
+        app,
+        ["audit-duplicates", "fixture-2026", "--data-root", str(tmp_path)],
+    )
+
+    assert result.exit_code == 2
+    assert "last_completed_phase=preflight" in result.output
+    assert "minimum_free_bytes=" in result.output
 
 
 def test_audit_rejects_corpus_checksum_mismatch(tmp_path: Path) -> None:
