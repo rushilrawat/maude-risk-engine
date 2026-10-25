@@ -247,6 +247,91 @@ def test_audit_finds_near_duplicates_when_corpus_order_reverses_temporal_order(
     assert near_pairs[0]["right_split"] == "validation"
 
 
+def test_audit_artifact_order_is_stable_for_repeated_identifiers(tmp_path: Path) -> None:
+    from maude.features.duplicates import build_duplicate_audit
+
+    base = " ".join(f"stable{number}" for number in range(40))
+    altered = base.replace("stable20", "changed20")
+
+    def with_evidence_id(
+        report_id: str, received: date, text: str, evidence_id: str
+    ) -> ModelingDocument:
+        document = _document(report_id, received, text)
+        narrative = document.narratives[0].model_copy(update={"evidence_id": evidence_id})
+        return document.model_copy(update={"narratives": (narrative,)})
+
+    documents = (
+        with_evidence_id("near-left", date(2024, 12, 1), base, "same-left-evidence"),
+        with_evidence_id("near-left", date(2025, 2, 1), base, "same-left-evidence"),
+        with_evidence_id("near-right", date(2025, 3, 1), altered, "same-right-evidence"),
+        with_evidence_id("near-right", date(2026, 3, 1), altered, "same-right-evidence"),
+        with_evidence_id(
+            "exact-repeat", date(2024, 1, 1), "same exact narrative words", "same-exact-evidence"
+        ),
+        with_evidence_id(
+            "exact-repeat", date(2025, 1, 1), "same exact narrative words", "same-exact-evidence"
+        ),
+        with_evidence_id(
+            "exact-anchor", date(2024, 2, 1), "same exact narrative words", "anchor-evidence"
+        ),
+    )
+
+    def build(root: Path, ordered: tuple[ModelingDocument, ...]) -> dict[str, bytes]:
+        corpus_path = _write_corpus(root, ordered)
+        manifest_path = corpus_path.parent / "manifest.json"
+        manifest = ModelingCorpusManifest.model_validate_json(
+            manifest_path.read_text(encoding="utf-8")
+        )
+        payload = corpus_path.read_bytes()
+        write_json_model(
+            manifest_path,
+            manifest.model_copy(update={"output_sha256": hashlib.sha256(payload).hexdigest()}),
+        )
+        audit = build_duplicate_audit(root, "fixture-2026")
+        return {
+            "exact_members": Path(audit.exact_members_path).read_bytes(),
+            "near_pairs": Path(audit.near_pairs_path).read_bytes(),
+        }
+
+    assert build(tmp_path / "forward", documents) == build(
+        tmp_path / "reverse", tuple(reversed(documents))
+    )
+
+
+def test_near_pair_output_query_uses_an_index_instead_of_a_temp_sort() -> None:
+    import maude.features.duplicates as duplicates
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        duplicates._index_schema(connection)
+        plan = connection.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT left_report_id, left_evidence_id, left_split,
+                      right_report_id, right_evidence_id, right_split, similarity
+               FROM near_pairs
+               ORDER BY left_report_id, left_evidence_id,
+                        right_report_id, right_evidence_id,
+                        left_split, right_split, similarity"""
+        ).fetchall()
+        exact_members_plan = connection.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT n.exact_sha256, n.report_id, n.evidence_id,
+                      n.received_date, n.split
+               FROM narratives AS n
+               WHERE n.exact_sha256 IN (
+                   SELECT exact_sha256 FROM narratives GROUP BY exact_sha256
+                   HAVING COUNT(DISTINCT report_id) > 1
+               )
+               ORDER BY n.exact_sha256, n.report_id, n.evidence_id,
+                        n.received_date, n.split"""
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert not any("USE TEMP B-TREE FOR ORDER BY" in str(row[3]) for row in plan)
+    assert not any("USE TEMP B-TREE FOR ORDER BY" in str(row[3]) for row in exact_members_plan)
+
+
 def test_audit_is_immutable_and_rejects_modified_results(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

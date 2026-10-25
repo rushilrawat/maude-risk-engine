@@ -434,10 +434,25 @@ def _run_exact_similarity_join(
             ),
         )
         if disk_guard is not None:
-            bounded_candidates = connection.execute(
-                "SELECT COUNT(*) FROM candidate_bounds"
+            candidate_storage = connection.execute(
+                """SELECT COUNT(*), COALESCE(SUM(
+                       length(CAST(prior.report_id AS BLOB))
+                       + length(CAST(prior.evidence_id AS BLOB))
+                       + length(CAST(prior.split AS BLOB))
+                       + length(CAST(target.report_id AS BLOB))
+                       + length(CAST(target.evidence_id AS BLOB))
+                       + length(CAST(target.split AS BLOB))
+                   ), 0)
+                   FROM candidate_bounds AS candidates
+                   JOIN narratives AS prior ON prior.id = candidates.narrative_id
+                   JOIN narratives AS target ON target.id = candidates.target_id"""
             ).fetchone()
-            disk_guard.check("exact-join-pairs", max(64, int(bounded_candidates[0] or 0) * 128))
+            candidate_count = int(candidate_storage[0] or 0)
+            candidate_key_bytes = int(candidate_storage[1] or 0)
+            disk_guard.check(
+                "exact-join-pairs",
+                max(64, candidate_count * 512 + candidate_key_bytes * 2),
+            )
         connection.execute(
             """WITH viable_candidates AS (
                    SELECT candidates.target_id, candidates.narrative_id
@@ -459,8 +474,13 @@ def _run_exact_similarity_join(
                     AND target_tokens.shingle_hash = prior_postings.shingle_hash
                    GROUP BY candidates.narrative_id, candidates.target_id
                )
-               INSERT OR IGNORE INTO near_pairs (left_id, right_id, similarity)
+               INSERT OR IGNORE INTO near_pairs (
+                   left_id, right_id, left_report_id, left_evidence_id, left_split,
+                   right_report_id, right_evidence_id, right_split, similarity
+               )
                SELECT overlaps.prior_id, overlaps.target_id,
+                      prior.report_id, prior.evidence_id, prior.split,
+                      target.report_id, target.evidence_id, target.split,
                       ROUND(
                           1.0 * overlaps.overlap_size
                           / (length(prior.shingles) / 8
@@ -506,14 +526,26 @@ def _index_schema(connection: sqlite3.Connection) -> None:
             exact_sha256 TEXT NOT NULL,
             shingles BLOB NOT NULL
         );
-        CREATE INDEX narratives_exact ON narratives(exact_sha256, report_id);
+        CREATE INDEX narratives_exact_members
+            ON narratives(exact_sha256, report_id, evidence_id, received_date, split);
         CREATE INDEX narratives_report ON narratives(report_id, split);
         CREATE TABLE near_pairs (
             left_id INTEGER NOT NULL REFERENCES narratives(id),
             right_id INTEGER NOT NULL REFERENCES narratives(id),
+            left_report_id TEXT NOT NULL,
+            left_evidence_id TEXT NOT NULL,
+            left_split TEXT NOT NULL,
+            right_report_id TEXT NOT NULL,
+            right_evidence_id TEXT NOT NULL,
+            right_split TEXT NOT NULL,
             similarity REAL NOT NULL,
             PRIMARY KEY (left_id, right_id)
         );
+        CREATE INDEX near_pairs_output_order
+            ON near_pairs(
+                left_report_id, left_evidence_id, right_report_id, right_evidence_id,
+                left_split, right_split, similarity
+            );
         """
     )
 
@@ -654,7 +686,8 @@ def _write_exact_outputs(
                    SELECT exact_sha256 FROM narratives GROUP BY exact_sha256
                    HAVING COUNT(DISTINCT report_id) > 1
                )
-               ORDER BY n.exact_sha256, n.report_id, n.evidence_id"""
+               ORDER BY n.exact_sha256, n.report_id, n.evidence_id,
+                        n.received_date, n.split"""
         )
         for exact_sha256, report_id, evidence_id, received_date, split in members:
             if disk_guard is not None and member_count and member_count % 1_000 == 0:
@@ -746,17 +779,16 @@ def _write_near_pairs(
     path: Path,
     disk_guard: _DiskSpaceGuard | None = None,
 ) -> int:
-    rows = connection.execute(
-        """SELECT l.report_id, l.evidence_id, l.split,
-                  r.report_id, r.evidence_id, r.split, p.similarity
-           FROM near_pairs AS p
-           JOIN narratives AS l ON l.id = p.left_id
-           JOIN narratives AS r ON r.id = p.right_id
-           ORDER BY l.report_id, l.evidence_id, r.report_id, r.evidence_id"""
-    )
     pair_count = 0
     if disk_guard is not None:
         disk_guard.check("near-pair-output", 1024 * 1024)
+    rows = connection.execute(
+        """SELECT left_report_id, left_evidence_id, left_split,
+                  right_report_id, right_evidence_id, right_split, similarity
+           FROM near_pairs
+           ORDER BY left_report_id, left_evidence_id, right_report_id, right_evidence_id,
+                    left_split, right_split, similarity"""
+    )
     with path.open("w", encoding="utf-8", newline="\n") as output:
         for (
             left_report,
