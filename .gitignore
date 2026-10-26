@@ -6,6 +6,9 @@ data/staging/
 data/rejects/
 data/manifests/
 data/locks/
+data/corpora/
+data/features/
+data/audits/
 *.zip
 DEVICE*.txt
 device*.txt

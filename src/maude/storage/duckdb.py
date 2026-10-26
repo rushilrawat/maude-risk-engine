@@ -6,7 +6,7 @@ evidence rows so their identity and source location cannot be lost in a join.
 """
 
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -264,20 +264,17 @@ def _validate_snapshot_provenance(
 
 def _validate_report_keys(connection: duckdb.DuckDBPyConnection, artifact: Path) -> None:
     """Reject duplicate report keys before exposing a document reader."""
-    duplicate = connection.execute(
-        """
-        SELECT CAST(mdr_report_key AS VARCHAR), COUNT(*)::BIGINT
-        FROM reports
-        GROUP BY mdr_report_key
-        HAVING COUNT(*) > 1
-        LIMIT 1
-        """
-    ).fetchone()
-    if duplicate is not None:
-        raise SnapshotSchemaError(
-            f"reports artifact {artifact} contains duplicate mdr_report_key "
-            f"{duplicate[0]!r} ({duplicate[1]} rows)"
-        )
+    cursor = connection.execute("SELECT mdr_report_key FROM reports ORDER BY mdr_report_key")
+    previous_key: Any = None
+    has_previous_key = False
+    while rows := cursor.fetchmany(10_000):
+        for (report_key,) in rows:
+            if has_previous_key and report_key == previous_key:
+                raise SnapshotSchemaError(
+                    f"reports artifact {artifact} contains duplicate mdr_report_key {report_key!r}"
+                )
+            previous_key = report_key
+            has_previous_key = True
 
 
 def open_snapshot(snapshot_path: Path) -> duckdb.DuckDBPyConnection:
@@ -293,17 +290,24 @@ def open_snapshot(snapshot_path: Path) -> duckdb.DuckDBPyConnection:
         artifacts = _find_artifacts(snapshot_path)
         for view_name, artifact in artifacts.items():
             _schema_columns(artifact, view_name)
-        connection = duckdb.connect(":memory:")
         with tempfile.TemporaryDirectory(prefix="maude-duckdb-validation-") as spill_directory:
-            connection.execute("SET memory_limit = ?", [_VALIDATION_MEMORY_LIMIT])
-            connection.execute("SET temp_directory = ?", [spill_directory])
-            _create_views(connection, artifacts)
-            _validate_snapshot_provenance(connection, artifacts)
-            _validate_report_keys(connection, artifacts["reports"])
-            # The spill directory is only needed for validation.  Resetting the
-            # setting before TemporaryDirectory cleanup keeps the returned
-            # caller-owned connection usable after this function returns.
-            connection.execute("SET temp_directory = ?", [""])
+            validation_connection = duckdb.connect(":memory:")
+            try:
+                validation_connection.execute("SET memory_limit = ?", [_VALIDATION_MEMORY_LIMIT])
+                validation_connection.execute("SET threads = 1")
+                validation_connection.execute("SET preserve_insertion_order = false")
+                validation_connection.execute("SET temp_directory = ?", [spill_directory])
+                _create_views(validation_connection, artifacts)
+                _validate_snapshot_provenance(validation_connection, artifacts)
+                _validate_report_keys(validation_connection, artifacts["reports"])
+            finally:
+                validation_connection.close()
+
+        # Return a fresh connection: validation may spill to its scratch directory,
+        # which must be closed before that directory can be removed.
+        connection = duckdb.connect(":memory:")
+        connection.execute("SET memory_limit = ?", [_VALIDATION_MEMORY_LIMIT])
+        _create_views(connection, artifacts)
         return connection
     except BaseException:
         if connection is not None:
@@ -408,3 +412,75 @@ def fetch_report_document(connection: duckdb.DuckDBPyConnection, report_id: str)
         narratives=tuple(narratives),
         dataset_snapshot_id=_as_text(row[6]),
     )
+
+
+def iter_report_documents(
+    connection: duckdb.DuckDBPyConnection, batch_rows: int = 10_000
+) -> Iterator[ReportDocument]:
+    """Yield stable report documents from DuckDB without materializing the corpus."""
+    if batch_rows < 1:
+        raise ValueError("batch_rows must be at least 1")
+
+    cursor = connection.execute(
+        """
+        SELECT report_id, reported_event_type, date_received,
+               product_codes, brand_names, manufacturers, dataset_snapshot_id,
+               mdr_text_key, text_type_code, foi_text,
+               _source_filename, _source_line_number
+        FROM report_documents
+        ORDER BY report_id,
+                 TRY_CAST(mdr_text_key AS BIGINT) NULLS FIRST,
+                 mdr_text_key,
+                 _source_filename,
+                 TRY_CAST(_source_line_number AS BIGINT),
+                 _source_line_number
+        """
+    )
+    report_rows: list[tuple[Any, ...]] = []
+    active_report_id: str | None = None
+
+    def as_document(rows: list[tuple[Any, ...]]) -> ReportDocument:
+        row = rows[0]
+        narratives: list[NarrativeEvidence] = []
+        for item in rows:
+            if item[7] is None:
+                continue
+            evidence_id = f"narrative:{_as_text(item[7])}"
+            try:
+                line_number = int(_as_text(item[11]))
+            except ValueError as error:
+                message = (
+                    "narratives artifact contains non-integer _source_line_number for "
+                    f"{evidence_id}"
+                )
+                raise SnapshotSchemaError(message) from error
+            narratives.append(
+                NarrativeEvidence(
+                    evidence_id=evidence_id,
+                    text_type_code=None if item[8] is None else str(item[8]),
+                    text=_as_text(item[9]),
+                    source_filename=_as_text(item[10]),
+                    source_line_number=line_number,
+                )
+            )
+        return ReportDocument(
+            report_id=_as_text(row[0]),
+            reported_event_type=None if row[1] is None else str(row[1]),
+            date_received=_as_date(row[2]),
+            product_codes=_sorted_unique_strings(row[3] or ()),
+            brand_names=_sorted_unique_strings(row[4] or ()),
+            manufacturers=_sorted_unique_strings(row[5] or ()),
+            narratives=tuple(narratives),
+            dataset_snapshot_id=_as_text(row[6]),
+        )
+
+    while rows := cursor.fetchmany(batch_rows):
+        for row in rows:
+            report_id = _as_text(row[0])
+            if active_report_id is not None and report_id != active_report_id:
+                yield as_document(report_rows)
+                report_rows = []
+            active_report_id = report_id
+            report_rows.append(row)
+    if report_rows:
+        yield as_document(report_rows)

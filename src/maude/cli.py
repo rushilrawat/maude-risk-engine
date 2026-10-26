@@ -6,6 +6,9 @@ from maude import __version__
 from maude.config import Settings
 from maude.domain.enums import QualityLevel, RefreshOutcome, RunStatus, TableKind
 from maude.domain.models import LocalAuditItem, LocalAuditResult, RefreshRunResult
+from maude.features.corpus import build_modeling_corpus
+from maude.features.duplicates import InsufficientDiskSpaceError, build_duplicate_audit
+from maude.features.tfidf import build_tfidf_baseline
 from maude.ingestion.manifests import load_manifest
 from maude.ingestion.pipeline import ingest_snapshot
 from maude.ingestion.refresh import refresh_fda
@@ -94,6 +97,75 @@ def refresh_fda_command() -> None:
     evidence = settings.data_root / "refresh-runs" / f"{result.run_id}.json"
     typer.echo(f"FAILED {phase} {detail} evidence={evidence}")
     raise typer.Exit(1)
+
+
+@app.command("build-corpus")
+def build_corpus(
+    snapshot_id: str,
+    data_root: Path | None = typer.Option(  # noqa: B008
+        None, help="Data root containing the promoted snapshot; defaults to MAUDE_DATA_ROOT."
+    ),
+    batch_rows: int = typer.Option(10_000, min=1, help="DuckDB rows fetched per batch."),
+) -> None:
+    """Build an immutable narrative-modeling corpus from one promoted snapshot."""
+    settings = Settings.model_validate({}) if data_root is None else Settings(data_root=data_root)
+    result = build_modeling_corpus(settings.data_root, snapshot_id, batch_rows=batch_rows)
+    typer.echo(
+        f"BUILT {result.snapshot_id} documents={result.documents_written} "
+        f"narratives={result.narratives_written} blank_omitted={result.blank_narratives_omitted} "
+        f"output={result.output_path} manifest={result.manifest_path}"
+    )
+
+
+@app.command("build-tfidf")
+def build_tfidf(
+    snapshot_id: str,
+    data_root: Path | None = typer.Option(  # noqa: B008
+        None, help="Data root containing the corpus; defaults to MAUDE_DATA_ROOT."
+    ),
+    batch_rows: int = typer.Option(5_000, min=1, help="Documents transformed per matrix shard."),
+    fit_sample_size: int = typer.Option(
+        10_000,
+        min=1,
+        help="Maximum deterministic training-period documents used to fit vocabularies.",
+    ),
+) -> None:
+    """Fit word/character TF-IDF on training data and transform held-out periods."""
+    settings = Settings.model_validate({}) if data_root is None else Settings(data_root=data_root)
+    result = build_tfidf_baseline(
+        settings.data_root,
+        snapshot_id,
+        batch_rows=batch_rows,
+        fit_sample_size=fit_sample_size,
+    )
+    counts = ", ".join(f"{split}={count}" for split, count in result.split_document_counts.items())
+    typer.echo(
+        f"BUILT {result.snapshot_id} {result.feature_version} {counts} "
+        f"fit_sample={result.fit_sample_size} output={result.output_directory}"
+    )
+
+
+@app.command("audit-duplicates")
+def audit_duplicates(
+    snapshot_id: str,
+    data_root: Path | None = typer.Option(  # noqa: B008
+        None, help="Data root containing the corpus; defaults to MAUDE_DATA_ROOT."
+    ),
+) -> None:
+    """Report exact and near-duplicate narratives across the fixed time splits."""
+    settings = Settings.model_validate({}) if data_root is None else Settings(data_root=data_root)
+    try:
+        result = build_duplicate_audit(settings.data_root, snapshot_id)
+    except InsufficientDiskSpaceError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo(
+        f"AUDITED {result.snapshot_id} narratives={result.narratives_scanned} "
+        f"exact_cross_split={result.exact_cross_split_groups} "
+        f"report_key_cross_split={result.report_key_cross_split_groups} "
+        f"near_cross_split={result.near_cross_split_pairs} "
+        f"undated={result.missing_date_narratives} output={result.output_directory}"
+    )
 
 
 @app.command("audit-local")

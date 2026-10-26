@@ -103,6 +103,12 @@ select evidence silently, infer causality, or finalize a case.
   snapshot.
 - Preserves manifests, rejects, reconciliation counts, and recovery information.
 - Supports safe retries and keeps the last validated snapshot live after failure.
+- Builds deterministic, source-linked report-level modeling text with NFC/whitespace
+  normalization while preserving original narrative evidence.
+- Builds a bounded-memory corpus from a pinned promoted snapshot and records a
+  versioned manifest with output checksum and written/omitted counts.
+- Fits reproducible word and character TF-IDF vocabularies from training-period
+  reports only, then writes checksummed, batched sparse matrices for each period.
 
 ## 🚀 Quickstart
 
@@ -135,6 +141,41 @@ files:
 ```bash
 uv run maude refresh-fda
 ```
+
+Build a narrative corpus from an already promoted snapshot:
+
+```bash
+uv run maude build-corpus fda-current-43bedbf20c68c84b
+```
+
+The corpus is written under `MAUDE_DATA_ROOT/corpora/` and keyed by snapshot and
+cleaning version. Existing corpus outputs are verified by checksum and reused.
+
+Fit the TF-IDF baseline from that corpus:
+
+```bash
+uv run maude build-tfidf fda-current-43bedbf20c68c84b
+```
+
+The initial research split is training through 2024, validation on 2025, and test
+from 2026 onward. Vocabulary is fitted on a deterministic, capped sample from the
+training period only; generated vectorizers and sparse matrices stay under
+`MAUDE_DATA_ROOT/features/`.
+
+Audit temporal leakage candidates from the same corpus:
+
+```bash
+uv run maude audit-duplicates fda-current-43bedbf20c68c84b
+```
+
+The checksum-bound v2 report counts undated narratives, lists exact duplicate
+groups and repeated report IDs across periods, and finds every cross-split pair
+with Jaccard similarity at least 0.8 over the existing unique word-trigram hash
+sets. Search is exhaustive for that representation and the configured temporal
+rules; it does not establish that narratives describe the same clinical event.
+V2 writes to a separate immutable directory and leaves v1 artifacts untouched.
+The audit preserves a 10 GiB free-space reserve and publishes nothing on a
+guarded stop. Audit outputs stay under `MAUDE_DATA_ROOT/audits/`.
 
 Operational details live in the
 [`local ingestion`](docs/runbooks/local-ingestion.md) and
@@ -205,7 +246,10 @@ system, not promises that they already exist.
 
 ### 5. [ ] Complete production corpus — **High**
 
-- Finish and document a clean end-to-end live refresh across every required table.
+- [x] Complete a live refresh of all four current-year table families; snapshot
+  `fda-current-43bedbf20c68c84b` was promoted with all 12 expected archive inputs.
+- Finish historical bootstrap and document a clean end-to-end refresh across the
+  expanded corpus.
 - Add historical annual files, device/patient problem codes, and controlled annual
   rollover reconciliation.
 - Add FDA device classification and recall context through separate, versioned
@@ -214,12 +258,16 @@ system, not promises that they already exist.
 
 ### 6. [ ] Narrative and feature engineering — **High**
 
-- Construct one evidence-linked document per report while preserving narrative-row
-  boundaries and text types.
+- [x] Add deterministic NFC/whitespace cleaning and an in-memory report-level
+  modeling document with source-linked narrative segments.
+- [x] Build a bounded-memory snapshot-to-corpus writer with versioned manifests and
+  counts for omitted blank narratives.
+- [x] Fit separate word and character TF-IDF baselines using training-only
+  vocabularies and time-based transform splits.
+- [x] Audit exact duplicate groups, repeated report IDs, and approximate
+  near-duplicate candidates across the fixed temporal splits.
 - Mask repeated regulatory boilerplate only in modeling representations.
-- Track exact and near-duplicate narratives so repeated submissions cannot dominate
-  evaluation unnoticed.
-- Build word and character TF-IDF plus frequency, reported-severity, novelty,
+- Build frequency, reported-severity, novelty,
   confidence, and report-volume-change features.
 
 ### 7. [ ] Clustering and statistical evaluation — **XHigh**
@@ -295,6 +343,10 @@ The complete product and scientific design is in
 [`FDA MAUDE Safety-Signal and Triage Platform Design`](docs/superpowers/specs/2026-09-04-fda-maude-signal-triage-design.md).
 The repository intentionally implements that design in independently verifiable
 vertical slices.
+
+New contributors can start with the [project guide](docs/PROJECT_GUIDE.md). The
+[issue backlog drafts](docs/ISSUE_BACKLOG.md) identify remaining work, dependencies,
+acceptance criteria, and the first files to inspect.
 
 ## ⚖️ Responsible use
 

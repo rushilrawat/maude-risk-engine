@@ -247,3 +247,30 @@ def test_duplicate_report_validation_handles_many_keys_under_bound(tmp_path: Pat
 
     with pytest.raises(SnapshotSchemaError, match=r"duplicate.*mdr_report_key"):
         open_snapshot(root)
+
+
+def test_open_snapshot_validates_many_unique_report_ids_under_memory_bound(
+    tmp_path: Path,
+) -> None:
+    root = _write_snapshot(tmp_path / "promoted")
+    row_count = 1_000_000
+    pq.write_table(
+        pa.table(
+            {
+                "mdr_report_key": pa.array(range(row_count), type=pa.int64()).cast(pa.string()),
+                "event_type": pa.array(["D"] * row_count, type=pa.string()),
+                "date_received": pa.array([date(2025, 1, 2)] * row_count, type=pa.date32()),
+                "dataset_snapshot_id": pa.array(["fixture-2025-06"] * row_count),
+            }
+        ),
+        root / "reports.parquet",
+        compression="zstd",
+    )
+
+    connection = open_snapshot(root)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM reports").fetchone() == (row_count,)
+        memory_limit = connection.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        assert float(str(memory_limit).split()[0]) <= 64
+    finally:
+        connection.close()
