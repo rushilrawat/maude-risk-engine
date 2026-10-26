@@ -11,6 +11,7 @@ import tempfile
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 from maude.domain.models import (
@@ -142,8 +143,9 @@ def _pack_shingles(shingles: tuple[int, ...]) -> bytes:
     return struct.pack(f">{len(shingles)}Q", *shingles) if shingles else b""
 
 
-def _unpack_shingles(value: bytes) -> tuple[int, ...]:
-    return tuple(item[0] for item in struct.iter_unpack(">Q", value))
+@lru_cache(maxsize=4_096)
+def _unpack_shingles(value: bytes) -> frozenset[int]:
+    return frozenset(item[0] for item in struct.iter_unpack(">Q", value))
 
 
 def _reusable_database_bytes(connection: sqlite3.Connection) -> int:

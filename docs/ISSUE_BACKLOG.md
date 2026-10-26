@@ -129,7 +129,9 @@ would breach the 10 GiB free-space reserve. A later run built a large staging
 index but did not complete or publish v2; its staging was removed after confirming
 no process held it open. No full-snapshot v2 counts are available, and v1 artifact
 hashes remain unchanged. Complete acceptance needs a successful run, immutable
-reopen/checksum verification, and findings review before clustering.
+reopen/checksum verification, and findings review before clustering. Repeated
+shingle decoding uses a bounded 4,096-entry cache, fixture-tested but not validated
+on a completed full-snapshot run.
 
 ## 4. Implement and evaluate failure-pattern clustering
 

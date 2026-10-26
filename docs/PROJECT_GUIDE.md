@@ -69,7 +69,8 @@ index because the projected next write would breach the 10 GiB free-space
 reserve. A later run built a large staging index but did not complete or publish
 v2; its staging was removed after confirming no process held it open. The v1
 artifact hashes remain unchanged, and no full-snapshot v2 counts or findings are
-available.
+available. Repeated shingle decoding also uses a bounded 4,096-entry cache,
+fixture-tested but not validated by a completed full-snapshot run.
 Full-snapshot acceptance needs a successful run and immutable reopen/checksum
 verification. Clustering must wait for the completed audit and a recorded
 split-exclusion policy. Signal scores, evidence index, LangGraph workflow, API,
