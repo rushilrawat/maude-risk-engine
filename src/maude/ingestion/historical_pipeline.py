@@ -213,6 +213,7 @@ def _ingest_table(
             normalized_path,
             spec_for(table),
             snapshot_id,
+            scratch_root=scratch_root,
         )
         normalized_parts.append(normalized_path)
         sources.append(bronze.source)

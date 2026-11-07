@@ -149,6 +149,8 @@ def normalize_bronze(
     silver_path: Path,
     spec: TableSpec,
     snapshot_id: str,
+    *,
+    scratch_root: Path | None = None,
 ) -> NormalizationResult:
     """Normalize one Bronze Parquet table to canonical Silver Parquet with DuckDB.
 
@@ -184,6 +186,11 @@ def normalize_bronze(
     try:
         temporary_path.unlink()
         connection = duckdb.connect()
+        if scratch_root is not None:
+            Path(scratch_root).mkdir(parents=True, exist_ok=True)
+            connection.execute(f"SET temp_directory = {_literal(scratch_root)}")
+            connection.execute("SET memory_limit = '4GB'")
+            connection.execute("SET threads = 1")
         count_row = connection.execute(failure_query).fetchone()
         if count_row is None:
             raise NormalizationError("DuckDB did not return the date parse failure count")
