@@ -257,7 +257,12 @@ system, not promises that they already exist.
   rollover reconciliation.
 - Add FDA device classification and recall context through separate, versioned
   enrichment pipelines.
-- Prepare a source adapter boundary for the FDA's evolving adverse-event systems.
+- [x] Complete the initial FDA-only source assessment: keep monthly MAUDE files
+  canonical, use openFDA for freshness comparison, and validate AEMS before
+  migration. See the [source assessment](docs/source-assessment.md).
+- [ ] Implement periodic freshness checks and a dual-source comparison for
+  openFDA/AEMS; measure record overlap and field coverage before changing the
+  canonical adapter.
 
 ### 6. [ ] Narrative and feature engineering — **High**
 

@@ -149,6 +149,7 @@ needs, output paths, failure recovery, and warnings.
 | Purpose | Files |
 |---|---|
 | Product overview and roadmap | [`../README.md`](../README.md) |
+| FDA source strategy and migration assessment | [`source-assessment.md`](source-assessment.md) |
 | Complete design, scientific boundaries, model/retrieval/UI architecture | [`superpowers/specs/2026-09-04-fda-maude-signal-triage-design.md`](superpowers/specs/2026-09-04-fda-maude-signal-triage-design.md) |
 | Current refresh design and safety requirements | [`superpowers/specs/2026-09-07-fda-current-refresh-design.md`](superpowers/specs/2026-09-07-fda-current-refresh-design.md) |
 | Refresh implementation breakdown | [`superpowers/plans/2026-09-08-fda-current-refresh.md`](superpowers/plans/2026-09-08-fda-current-refresh.md) |

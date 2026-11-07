@@ -70,6 +70,26 @@ Device and patient problem-code association tables remain a separate follow-up;
 their schemas and historical reconciliation are not included in this core
 four-table snapshot.
 
+## Build the combined research corpus
+
+The historical snapshot ends in 2025 and the current-year snapshot is published
+separately. Keep both source snapshots immutable, then compose them for temporal
+features and evaluation:
+
+```bash
+uv run maude build-research-corpus \
+  fda-history-<historical-fingerprint> fda-current-<current-fingerprint> \
+  --data-root "/Volumes/SanDisk Ext/MAUDE/generated-data-validation"
+```
+
+The command verifies that report keys do not overlap between the source master
+tables, streams the source corpora into a deterministic, checksum-bound corpus,
+and records both source snapshot IDs and corpus hashes. It refuses to publish
+when report keys overlap. Use the printed `fda-research-<fingerprint>` ID with
+`maude build-tfidf` and `maude audit-duplicates` for the 2024–2026 temporal
+evaluation. The derived corpus does not modify source snapshots or
+`manifests/current.json`.
+
 ## FDA source and interpretation
 
 The source is the [FDA MDR Data Files page](https://www.fda.gov/medical-devices/medical-device-reporting-mdr-how-report-medical-device-problems/mdr-data-files).

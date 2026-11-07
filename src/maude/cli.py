@@ -12,6 +12,7 @@ from maude.domain.models import (
     RefreshRunResult,
 )
 from maude.features.corpus import build_modeling_corpus
+from maude.features.corpus import build_research_corpus as build_research_modeling_corpus
 from maude.features.duplicates import InsufficientDiskSpaceError, build_duplicate_audit
 from maude.features.tfidf import build_tfidf_baseline
 from maude.ingestion.historical_pipeline import ingest_fda_history
@@ -180,6 +181,28 @@ def build_corpus(
     typer.echo(
         f"BUILT {result.snapshot_id} documents={result.documents_written} "
         f"narratives={result.narratives_written} blank_omitted={result.blank_narratives_omitted} "
+        f"output={result.output_path} manifest={result.manifest_path}"
+    )
+
+
+@app.command("build-research-corpus")
+def build_research_corpus_command(
+    snapshot_ids: list[str] = typer.Argument(  # noqa: B008
+        ..., help="Two or more promoted source snapshot IDs."
+    ),
+    data_root: Path | None = typer.Option(  # noqa: B008
+        None, help="Data root containing the snapshots; defaults to MAUDE_DATA_ROOT."
+    ),
+    batch_rows: int = typer.Option(10_000, min=1, help="DuckDB rows fetched per source batch."),
+) -> None:
+    """Combine disjoint promoted snapshots for research and temporal evaluation."""
+    settings = Settings.model_validate({}) if data_root is None else Settings(data_root=data_root)
+    result = build_research_modeling_corpus(
+        settings.data_root, snapshot_ids, batch_rows=batch_rows
+    )
+    typer.echo(
+        f"BUILT {result.snapshot_id} sources={','.join(result.source_snapshot_ids)} "
+        f"documents={result.documents_written} narratives={result.narratives_written} "
         f"output={result.output_path} manifest={result.manifest_path}"
     )
 

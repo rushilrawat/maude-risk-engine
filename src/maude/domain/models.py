@@ -293,7 +293,10 @@ class ModelingCorpusManifest(ContractModel):
     corpus_format_version: str
     cleaning_version: str
     snapshot_id: str
-    promoted_snapshot_path: str
+    promoted_snapshot_path: str | None
+    source_snapshot_ids: tuple[str, ...] = ()
+    source_snapshot_paths: tuple[str, ...] = ()
+    source_corpus_sha256: tuple[tuple[str, str], ...] = ()
     output_path: str
     manifest_path: str
     output_sha256: str
