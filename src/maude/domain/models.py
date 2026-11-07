@@ -150,6 +150,7 @@ class HistoricalAcquisitionRun(ContractModel):
     expected_archive_count: int = Field(ge=0)
     catalog: CatalogEvidence | None = None
     artifacts: tuple[DownloadedArtifact, ...] = ()
+    resumed_from: UUID | None = None
     failure: HistoricalAcquisitionFailure | None = None
 
     @field_validator("started_at", "finished_at")

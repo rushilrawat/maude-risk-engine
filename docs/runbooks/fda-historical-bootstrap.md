@@ -32,8 +32,9 @@ uv run maude download-fda-history \
 
 Successful output reports the archive count, total compressed bytes, and run
 manifest path. A failed run records the last completed archive and failure in
-its manifest. Rerunning is safe: identical downloads resolve to the same
-content-addressed raw objects, though the files are fetched again.
+its manifest. Rerunning with the same preserved FDA catalog resumes previously
+validated downloads after checking their stored checksums, then fetches only
+missing or invalid archives. A changed catalog triggers a fresh acquisition.
 
 ## Next step
 
