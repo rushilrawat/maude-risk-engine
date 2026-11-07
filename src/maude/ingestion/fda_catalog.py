@@ -35,6 +35,16 @@ CURRENT_ARCHIVES = {
     "foitextchange.zip": (TableKind.NARRATIVE, SourceRole.CHANGE),
 }
 
+HISTORICAL_ARCHIVES = {
+    "mdrfoithru2025.zip": TableKind.MASTER,
+    "patientthru2025.zip": TableKind.PATIENT,
+    "foidevthru1997.zip": TableKind.DEVICE,
+    **{f"foidev{year}.zip": TableKind.DEVICE for year in (1998, 1999)},
+    **{f"device{year}.zip": TableKind.DEVICE for year in range(2000, 2026)},
+    "foitextthru1995.zip": TableKind.NARRATIVE,
+    **{f"foitext{year}.zip": TableKind.NARRATIVE for year in range(1996, 2026)},
+}
+
 
 class CatalogError(ValueError):
     """Raised when the FDA catalog cannot produce one trusted current source set."""
@@ -141,6 +151,36 @@ def parse_current_catalog(html: str, catalog_url: str) -> tuple[DiscoveredArtifa
     return tuple(discovered[(table, role)] for table in TableKind for role in SourceRole)
 
 
+def parse_historical_catalog(html: str, catalog_url: str) -> tuple[DiscoveredArtifact, ...]:
+    """Return the allowlisted core MAUDE archives through 2025 from the FDA catalog."""
+    _validate_catalog_url(catalog_url)
+    parser = _CatalogParser()
+    parser.feed(html)
+    parser.close()
+
+    discovered: dict[str, DiscoveredArtifact] = {}
+    for href in parser.links:
+        url = urljoin(catalog_url, href)
+        filename = urlsplit(url).path.rsplit("/", 1)[-1]
+        table = HISTORICAL_ARCHIVES.get(filename)
+        if table is None:
+            continue
+        trusted_filename = validate_archive_url(url)
+        if trusted_filename in discovered:
+            raise CatalogError(f"duplicate FDA historical artifact: {trusted_filename}")
+        discovered[trusted_filename] = DiscoveredArtifact(
+            table=table,
+            role=SourceRole.BASE,
+            filename=trusted_filename,
+            url=url,
+        )
+
+    missing = sorted(set(HISTORICAL_ARCHIVES) - set(discovered))
+    if missing:
+        raise CatalogError(f"missing FDA historical artifacts: {', '.join(missing)}")
+    return tuple(discovered[filename] for filename in HISTORICAL_ARCHIVES)
+
+
 def _read_catalog(response: HttpResponse) -> bytes:
     read = response.read
     body = bytearray()
@@ -196,6 +236,39 @@ def fetch_current_catalog(
     except (LookupError, UnicodeDecodeError) as error:
         raise CatalogError(f"FDA catalog could not be decoded as {charset}") from error
     artifacts = parse_current_catalog(html, final_url)
+    evidence = CatalogEvidence(
+        catalog_url=FDA_CATALOG_URL,
+        retrieved_at=retrieved_at,
+        final_url=final_url,
+        etag=etag,
+        last_modified=last_modified,
+        sha256=digest,
+        html_path=str(path),
+    )
+    return evidence, artifacts
+
+
+def fetch_historical_catalog(
+    opener: UrlOpener,
+    layout: RefreshLayout,
+    retrieved_at: datetime,
+) -> tuple[CatalogEvidence, tuple[DiscoveredArtifact, ...]]:
+    """Fetch, preserve, and parse the official FDA historical MAUDE catalog."""
+    request = Request(FDA_CATALOG_URL, headers={"User-Agent": "maude-risk-engine/0.1"})
+    with opener(request, CATALOG_TIMEOUT_SECONDS) as response:
+        final_url = response.geturl()
+        _validate_catalog_url(final_url)
+        body = _read_catalog(response)
+        charset = response.headers.get_content_charset() or "utf-8"
+        etag = response.headers.get("ETag")
+        last_modified = response.headers.get("Last-Modified")
+    digest = hashlib.sha256(body).hexdigest()
+    path = _store_catalog(layout, body, digest)
+    try:
+        html = body.decode(charset)
+    except (LookupError, UnicodeDecodeError) as error:
+        raise CatalogError(f"FDA catalog could not be decoded as {charset}") from error
+    artifacts = parse_historical_catalog(html, final_url)
     evidence = CatalogEvidence(
         catalog_url=FDA_CATALOG_URL,
         retrieved_at=retrieved_at,

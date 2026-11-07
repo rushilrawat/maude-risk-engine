@@ -248,6 +248,9 @@ system, not promises that they already exist.
 
 - [x] Complete a live refresh of all four current-year table families; snapshot
   `fda-current-43bedbf20c68c84b` was promoted with all 12 expected archive inputs.
+- [x] Add strict FDA-catalog discovery and content-addressed acquisition for 62
+  core historical MAUDE archives through 2025; parsing and joining those archives
+  into a historical corpus remain open.
 - Finish historical bootstrap and document a clean end-to-end refresh across the
   expanded corpus.
 - Add historical annual files, device/patient problem codes, and controlled annual

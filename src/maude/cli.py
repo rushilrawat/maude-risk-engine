@@ -9,6 +9,7 @@ from maude.domain.models import LocalAuditItem, LocalAuditResult, RefreshRunResu
 from maude.features.corpus import build_modeling_corpus
 from maude.features.duplicates import InsufficientDiskSpaceError, build_duplicate_audit
 from maude.features.tfidf import build_tfidf_baseline
+from maude.ingestion.history import download_fda_history as run_fda_history_download
 from maude.ingestion.manifests import load_manifest
 from maude.ingestion.pipeline import ingest_snapshot
 from maude.ingestion.refresh import refresh_fda
@@ -96,6 +97,30 @@ def refresh_fda_command() -> None:
     detail = "unknown failure" if failure is None else f"{failure.error_type}: {failure.message}"
     evidence = settings.data_root / "refresh-runs" / f"{result.run_id}.json"
     typer.echo(f"FAILED {phase} {detail} evidence={evidence}")
+    raise typer.Exit(1)
+
+
+@app.command("download-fda-history")
+def download_fda_history_command(
+    data_root: Path | None = typer.Option(  # noqa: B008
+        None, help="Destination data root; defaults to MAUDE_DATA_ROOT."
+    ),
+) -> None:
+    """Acquire the official core MAUDE archives through 2025."""
+    settings = Settings.model_validate({}) if data_root is None else Settings(data_root=data_root)
+    result = run_fda_history_download(settings)
+    manifest_path = settings.data_root / "history-runs" / f"{result.run_id}.json"
+    if result.status == "complete":
+        total_bytes = sum(artifact.byte_size for artifact in result.artifacts)
+        typer.echo(
+            f"ACQUIRED archives={len(result.artifacts)} bytes={total_bytes} "
+            f"manifest={manifest_path}"
+        )
+        return
+    failure = result.failure
+    phase = failure.phase if failure is not None else "unknown"
+    detail = "unknown failure" if failure is None else f"{failure.error_type}: {failure.message}"
+    typer.echo(f"FAILED {phase} {detail} manifest={manifest_path}")
     raise typer.Exit(1)
 
 

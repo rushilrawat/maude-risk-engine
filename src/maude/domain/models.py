@@ -2,6 +2,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -131,6 +132,31 @@ class RefreshRunResult(ContractModel):
     def require_timezone(cls, value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:
             raise ValueError("refresh run timestamps must be timezone-aware")
+        return value
+
+
+class HistoricalAcquisitionFailure(ContractModel):
+    phase: str
+    url: str | None = None
+    error_type: str
+    message: str
+
+
+class HistoricalAcquisitionRun(ContractModel):
+    run_id: UUID
+    started_at: datetime
+    finished_at: datetime | None
+    status: Literal["running", "complete", "failed"]
+    expected_archive_count: int = Field(ge=0)
+    catalog: CatalogEvidence | None = None
+    artifacts: tuple[DownloadedArtifact, ...] = ()
+    failure: HistoricalAcquisitionFailure | None = None
+
+    @field_validator("started_at", "finished_at")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("historical acquisition timestamps must be timezone-aware")
         return value
 
 
