@@ -235,6 +235,9 @@ def reconcile_table(
         ) as spill_directory:
             connection = duckdb.connect()
             connection.execute(f"SET temp_directory = {_literal(spill_directory)}")
+            connection.execute("SET memory_limit = '4GB'")
+            connection.execute("SET threads = 1")
+            connection.execute("SET preserve_insertion_order = false")
             prepared = {
                 role: _prepare_role(
                     connection,
