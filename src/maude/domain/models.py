@@ -189,6 +189,7 @@ class SnapshotResult(ContractModel):
     promoted_path: str | None
     parser_version: str
     inputs: Sequence[SourceIdentity] = ()
+    source_acquisition_run_id: UUID | None = None
     reconciliation: Sequence[ReconciliationStats] = Field(default_factory=list)
     failure: FailureEvidence | None = None
     promotion: PromotionIntent | None = None

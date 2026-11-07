@@ -36,13 +36,39 @@ its manifest. Rerunning with the same preserved FDA catalog resumes previously
 validated downloads after checking their stored checksums, then fetches only
 missing or invalid archives. A changed catalog triggers a fresh acquisition.
 
-## Next step
+## Parse and publish the historical snapshot
 
-Build a separate historical-corpus ingestion flow that parses the archives in
-batches, preserves source-year provenance, reconciles business keys and
-conflicts across years, validates cross-table report-key coverage, and publishes
-an immutable historical snapshot. Keep the current-year refresh as a separate
-input until annual rollover behavior is verified.
+Pass the successful acquisition manifest to the historical ingestion command:
+
+```bash
+uv run maude ingest-fda-history \
+  "/Volumes/SanDisk Ext/MAUDE/generated-data-validation/history-runs/<run-id>.json" \
+  --data-root "/Volumes/SanDisk Ext/MAUDE/generated-data-validation"
+```
+
+The command parses each source in bounded batches, preserves archive and line
+provenance, normalizes each annual part, reconciles duplicate business keys and
+quarantines conflicting rows. It applies the existing row-conservation,
+rejection-rate, uniqueness, and cross-table report-key checks before publishing
+an immutable `fda-history-<fingerprint>` snapshot under `silver/`. DuckDB spill
+files and staging output use the configured data volume. It does not update
+`manifests/current.json`; current-year data remain a separate snapshot until
+annual rollover behavior is verified.
+
+If ingestion fails, inspect `manifests/fda-history-<fingerprint>.json` and its
+quality findings. No partial historical snapshot is promoted. Rerunning uses the
+preserved raw archives and starts the failed snapshot build again.
+
+After promotion, the existing corpus command can build the narrative dataset:
+
+```bash
+uv run maude build-corpus fda-history-<fingerprint> \
+  --data-root "/Volumes/SanDisk Ext/MAUDE/generated-data-validation"
+```
+
+Device and patient problem-code association tables remain a separate follow-up;
+their schemas and historical reconciliation are not included in this core
+four-table snapshot.
 
 ## FDA source and interpretation
 

@@ -5,10 +5,16 @@ import typer
 from maude import __version__
 from maude.config import Settings
 from maude.domain.enums import QualityLevel, RefreshOutcome, RunStatus, TableKind
-from maude.domain.models import LocalAuditItem, LocalAuditResult, RefreshRunResult
+from maude.domain.models import (
+    HistoricalAcquisitionRun,
+    LocalAuditItem,
+    LocalAuditResult,
+    RefreshRunResult,
+)
 from maude.features.corpus import build_modeling_corpus
 from maude.features.duplicates import InsufficientDiskSpaceError, build_duplicate_audit
 from maude.features.tfidf import build_tfidf_baseline
+from maude.ingestion.historical_pipeline import ingest_fda_history
 from maude.ingestion.history import download_fda_history as run_fda_history_download
 from maude.ingestion.manifests import load_manifest
 from maude.ingestion.pipeline import ingest_snapshot
@@ -121,6 +127,42 @@ def download_fda_history_command(
     phase = failure.phase if failure is not None else "unknown"
     detail = "unknown failure" if failure is None else f"{failure.error_type}: {failure.message}"
     typer.echo(f"FAILED {phase} {detail} manifest={manifest_path}")
+    raise typer.Exit(1)
+
+
+@app.command("ingest-fda-history")
+def ingest_fda_history_command(
+    acquisition_manifest: Path,
+    data_root: Path | None = typer.Option(  # noqa: B008
+        None, help="Destination data root; defaults to MAUDE_DATA_ROOT."
+    ),
+) -> None:
+    """Parse and publish an immutable historical MAUDE snapshot from an acquisition manifest."""
+    settings = Settings.model_validate({}) if data_root is None else Settings(data_root=data_root)
+    acquisition = HistoricalAcquisitionRun.model_validate_json(
+        acquisition_manifest.read_text(encoding="utf-8")
+    )
+    result = ingest_fda_history(acquisition, settings)
+    if result.status is RunStatus.PROMOTED and result.promotion is None:
+        counts = ", ".join(
+            f"{table.table.value}={table.stats.rows_accepted}/{table.stats.rows_rejected}"
+            for table in result.tables
+        )
+        manifest_path = settings.data_root / "manifests" / f"{result.snapshot_id}.json"
+        typer.echo(
+            f"PROMOTED {result.snapshot_id} {result.promoted_path} "
+            f"counts: {counts} manifest={manifest_path}"
+        )
+        return
+    failure = result.failure
+    if failure is not None:
+        typer.echo(
+            f"FAILED {result.snapshot_id} {failure.phase} "
+            f"{failure.error_type}: {failure.message}"
+        )
+    else:
+        phase = result.promotion.phase if result.promotion is not None else "incomplete"
+        typer.echo(f"INCOMPLETE {result.snapshot_id} phase={phase}")
     raise typer.Exit(1)
 
 

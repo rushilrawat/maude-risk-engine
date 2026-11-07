@@ -125,9 +125,13 @@ def _sql_literal(value: str | Path) -> str:
 
 
 @contextmanager
-def _quality_connection() -> Iterator[Any]:
+def _quality_connection(scratch_root: Path | None = None) -> Iterator[Any]:
     """Open a temporary, spill-capable DuckDB connection and always close it."""
-    with tempfile.TemporaryDirectory(prefix="maude-quality-") as temporary_directory:
+    if scratch_root is not None:
+        Path(scratch_root).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="maude-quality-", dir=scratch_root
+    ) as temporary_directory:
         connection = duckdb.connect()
         try:
             connection.execute(f"SET temp_directory = {_sql_literal(temporary_directory)}")
@@ -377,12 +381,15 @@ def _parquet_orphans(
 
 
 def run_quality_checks(
-    tables: Sequence[TableResult], previous: SnapshotResult | None = None
+    tables: Sequence[TableResult],
+    previous: SnapshotResult | None = None,
+    *,
+    scratch_root: Path | None = None,
 ) -> tuple[QualityResult, ...]:
     """Run the snapshot quality gates using only the supplied table results."""
     ordered = tuple(sorted(tables, key=lambda table: table.table.value))
     results: list[QualityResult] = [required_table_set(ordered)]
-    with _quality_connection() as connection:
+    with _quality_connection(scratch_root) as connection:
         for table in ordered:
             results.append(
                 row_conservation(

@@ -217,6 +217,7 @@ def reconcile_table(
     output_path: Path,
     *,
     conflict_path: Path | None = None,
+    scratch_root: Path | None = None,
 ) -> tuple[ReconciliationStats, ...]:
     """Select one current row per business key using change/add/base precedence."""
     keys = tuple(normalize_column(column) for column in spec_for(table).business_key)
@@ -227,7 +228,11 @@ def reconcile_table(
     connection: Any | None = None
     try:
         temporary.unlink()
-        with tempfile.TemporaryDirectory(prefix="maude-reconcile-") as spill_directory:
+        if scratch_root is not None:
+            Path(scratch_root).mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="maude-reconcile-", dir=scratch_root
+        ) as spill_directory:
             connection = duckdb.connect()
             connection.execute(f"SET temp_directory = {_literal(spill_directory)}")
             prepared = {
