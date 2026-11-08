@@ -17,10 +17,10 @@ _PRIORITY = {
     SourceRole.CHANGE: 2,
 }
 _INTERNAL_PRIORITY = "__maude_role_priority"
-_INTERNAL_RANK = "__maude_selection_rank"
 _INTERNAL_KEY_COUNT = "__maude_key_count"
 _INTERNAL_HASH_COUNT = "__maude_hash_count"
-_INTERNAL_ROLE_ROW = "__maude_role_row"
+_INTERNAL_FIRST_ROW = "__maude_first_row"
+RECONCILIATION_VERSION = "role-precedence-aggregate-v2"
 
 
 class ReconciliationError(ValueError):
@@ -50,7 +50,10 @@ def _role_select(relation: str, role: SourceRole) -> str:
 
 
 def _join(left: str, right: str, keys: tuple[str, ...]) -> str:
-    return " AND ".join(f"{left}.{_identifier(key)} = {right}.{_identifier(key)}" for key in keys)
+    return " AND ".join(
+        f"{left}.{_identifier(key)} IS NOT DISTINCT FROM {right}.{_identifier(key)}"
+        for key in keys
+    )
 
 
 def _validate_inputs(
@@ -69,10 +72,9 @@ def _validate_inputs(
             )
         reserved = {
             _INTERNAL_PRIORITY,
-            _INTERNAL_RANK,
             _INTERNAL_KEY_COUNT,
             _INTERNAL_HASH_COUNT,
-            _INTERNAL_ROLE_ROW,
+            _INTERNAL_FIRST_ROW,
         } & columns
         if reserved:
             column = reserved.pop()
@@ -88,19 +90,25 @@ def _prepare_role(
     allow_conflicts: bool,
 ) -> tuple[str, str, int, int]:
     key_list = ", ".join(_identifier(key) for key in keys)
+    raw = f"role_{role.value}_raw"
+    stats = f"role_{role.value}_stats"
     ranked = f"role_{role.value}_ranked"
     selected = f"role_{role.value}"
     connection.execute(
+        f"CREATE TEMP VIEW {_identifier(raw)} AS "
+        f"SELECT * FROM read_parquet({_literal(path)}, file_row_number = true)"
+    )
+    connection.execute(
         " ".join(
             (
-                f"CREATE TEMP VIEW {_identifier(ranked)} AS SELECT *,",
-                f"count(*) OVER (PARTITION BY {key_list}) AS",
-                f"{_identifier(_INTERNAL_KEY_COUNT)},",
-                f"count(DISTINCT record_content_hash) OVER (PARTITION BY {key_list}) AS",
+                f"CREATE TEMP TABLE {_identifier(stats)} AS SELECT",
+                f"{key_list},",
+                f"count(*)::BIGINT AS {_identifier(_INTERNAL_KEY_COUNT)},",
+                "count(DISTINCT record_content_hash)::BIGINT AS",
                 f"{_identifier(_INTERNAL_HASH_COUNT)},",
-                f"row_number() OVER (PARTITION BY {key_list} ORDER BY file_row_number) AS",
-                f"{_identifier(_INTERNAL_ROLE_ROW)}",
-                f"FROM read_parquet({_literal(path)}, file_row_number = true)",
+                f"min(file_row_number)::BIGINT AS {_identifier(_INTERNAL_FIRST_ROW)}",
+                f"FROM {_identifier(raw)}",
+                f"GROUP BY {key_list}",
             )
         )
     )
@@ -109,9 +117,8 @@ def _prepare_role(
             (
                 "SELECT coalesce(sum(",
                 f"{_identifier(_INTERNAL_KEY_COUNT)} - 1), 0)::BIGINT",
-                f"FROM {_identifier(ranked)}",
-                f"WHERE {_identifier(_INTERNAL_ROLE_ROW)} = 1",
-                f"AND {_identifier(_INTERNAL_HASH_COUNT)} = 1",
+                f"FROM {_identifier(stats)}",
+                f"WHERE {_identifier(_INTERNAL_HASH_COUNT)} = 1",
                 f"AND {_identifier(_INTERNAL_KEY_COUNT)} > 1",
             )
         )
@@ -121,9 +128,8 @@ def _prepare_role(
             (
                 "SELECT count(*)::BIGINT,",
                 f"coalesce(sum({_identifier(_INTERNAL_KEY_COUNT)}), 0)::BIGINT",
-                f"FROM {_identifier(ranked)}",
-                f"WHERE {_identifier(_INTERNAL_ROLE_ROW)} = 1",
-                f"AND {_identifier(_INTERNAL_HASH_COUNT)} > 1",
+                f"FROM {_identifier(stats)}",
+                f"WHERE {_identifier(_INTERNAL_HASH_COUNT)} > 1",
             )
         )
     ).fetchone()
@@ -138,14 +144,27 @@ def _prepare_role(
     connection.execute(
         " ".join(
             (
+                f"CREATE TEMP VIEW {_identifier(ranked)} AS SELECT source_rows.*,",
+                f"key_stats.{_identifier(_INTERNAL_KEY_COUNT)},",
+                f"key_stats.{_identifier(_INTERNAL_HASH_COUNT)},",
+                f"key_stats.{_identifier(_INTERNAL_FIRST_ROW)}",
+                f"FROM {_identifier(raw)} AS source_rows",
+                f"INNER JOIN {_identifier(stats)} AS key_stats",
+                f"ON {_join('source_rows', 'key_stats', keys)}",
+            )
+        )
+    )
+    connection.execute(
+        " ".join(
+            (
                 f"CREATE TEMP VIEW {_identifier(selected)} AS SELECT * EXCLUDE (",
                 "file_row_number,",
                 f"{_identifier(_INTERNAL_KEY_COUNT)},",
                 f"{_identifier(_INTERNAL_HASH_COUNT)},",
-                f"{_identifier(_INTERNAL_ROLE_ROW)}",
+                f"{_identifier(_INTERNAL_FIRST_ROW)}",
                 f") FROM {_identifier(ranked)}",
                 f"WHERE {_identifier(_INTERNAL_HASH_COUNT)} = 1",
-                f"AND {_identifier(_INTERNAL_ROLE_ROW)} = 1",
+                f"AND file_row_number = {_identifier(_INTERNAL_FIRST_ROW)}",
             )
         )
     )
@@ -165,28 +184,26 @@ def _stats_for_role(
     key_list = ", ".join(_identifier(key) for key in keys)
     lower_join = _join("role_rows", "lower_rows", keys)
     selected_join = _join("role_rows", "selected_rows", keys)
-    first_key = _identifier(keys[0])
+    priority_column = _identifier(_INTERNAL_PRIORITY)
     query = " ".join(
         (
-            "WITH ranked_lower AS (",
-            f"SELECT {key_list}, record_content_hash,",
-            f"row_number() OVER (PARTITION BY {key_list}",
-            f"ORDER BY {_identifier(_INTERNAL_PRIORITY)} DESC) AS lower_rank",
+            "WITH lower_rows AS (",
+            f"SELECT {key_list},",
+            f"arg_max(record_content_hash, {priority_column}) AS record_content_hash,",
+            "TRUE AS lower_present",
             "FROM candidates",
-            f"WHERE {_identifier(_INTERNAL_PRIORITY)} < {priority}",
-            "), lower_rows AS (",
-            f"SELECT {key_list}, record_content_hash FROM ranked_lower WHERE lower_rank = 1",
+            f"WHERE {priority_column} < {priority}",
+            f"GROUP BY {key_list}",
             "), selected_rows AS (",
-            f"SELECT {key_list}, {_identifier(_INTERNAL_PRIORITY)} AS selected_priority",
-            "FROM selected_candidates",
+            f"SELECT {key_list}, selected_priority FROM selected_key_priority",
             "), role_rows AS (",
             f"SELECT * FROM {_identifier(relation)}",
             ") SELECT",
-            f"coalesce(count_if(lower_rows.{first_key} IS NULL), 0)::BIGINT AS inserted,",
-            f"coalesce(count_if(lower_rows.{first_key} IS NOT NULL AND",
+            "coalesce(count_if(lower_rows.lower_present IS NULL), 0)::BIGINT AS inserted,",
+            "coalesce(count_if(lower_rows.lower_present IS NOT NULL AND",
             "role_rows.record_content_hash IS DISTINCT FROM lower_rows.record_content_hash), 0)",
             "::BIGINT AS updated,",
-            f"coalesce(count_if(lower_rows.{first_key} IS NOT NULL AND",
+            "coalesce(count_if(lower_rows.lower_present IS NOT NULL AND",
             "role_rows.record_content_hash IS NOT DISTINCT FROM",
             "lower_rows.record_content_hash), 0)",
             "::BIGINT AS unchanged,",
@@ -256,12 +273,23 @@ def reconcile_table(
             connection.execute(
                 " ".join(
                     (
-                        "CREATE TEMP VIEW selected_candidates AS SELECT * FROM (",
-                        "SELECT *, row_number() OVER (",
-                        f"PARTITION BY {key_list}",
-                        f"ORDER BY {_identifier(_INTERNAL_PRIORITY)} DESC",
-                        f") AS {_identifier(_INTERNAL_RANK)} FROM candidates",
-                        f") AS ranked WHERE {_identifier(_INTERNAL_RANK)} = 1",
+                        "CREATE TEMP TABLE selected_key_priority AS SELECT",
+                        f"{key_list},",
+                        f"max({_identifier(_INTERNAL_PRIORITY)})::INTEGER AS selected_priority",
+                        "FROM candidates",
+                        f"GROUP BY {key_list}",
+                    )
+                )
+            )
+            connection.execute(
+                " ".join(
+                    (
+                        "CREATE TEMP VIEW selected_candidates AS SELECT candidate.*",
+                        "FROM candidates AS candidate",
+                        "INNER JOIN selected_key_priority AS winners",
+                        f"ON {_join('candidate', 'winners', keys)}",
+                        f"AND candidate.{_identifier(_INTERNAL_PRIORITY)} = "
+                        "winners.selected_priority",
                     )
                 )
             )
@@ -287,7 +315,7 @@ def reconcile_table(
                             "SELECT * EXCLUDE (file_row_number,",
                             f"{_identifier(_INTERNAL_KEY_COUNT)},",
                             f"{_identifier(_INTERNAL_HASH_COUNT)},",
-                            f"{_identifier(_INTERNAL_ROLE_ROW)}),",
+                            f"{_identifier(_INTERNAL_FIRST_ROW)}),",
                             "'conflicting_duplicate_business_key' AS _conflict_reason",
                             f"FROM {_identifier(prepared[role][1])}",
                             f"WHERE {_identifier(_INTERNAL_HASH_COUNT)} > 1",
@@ -302,7 +330,7 @@ def reconcile_table(
                 " ".join(
                     (
                         "COPY (SELECT * EXCLUDE (",
-                        f"{_identifier(_INTERNAL_PRIORITY)}, {_identifier(_INTERNAL_RANK)}",
+                        f"{_identifier(_INTERNAL_PRIORITY)}",
                         ") FROM selected_candidates",
                         f"ORDER BY {key_list}) TO {_literal(temporary)} (FORMAT PARQUET)",
                     )

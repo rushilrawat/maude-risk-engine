@@ -14,6 +14,7 @@ from maude.domain.models import (
 from maude.features.corpus import build_modeling_corpus
 from maude.features.corpus import build_research_corpus as build_research_modeling_corpus
 from maude.features.duplicates import InsufficientDiskSpaceError, build_duplicate_audit
+from maude.features.signals import build_signal_features
 from maude.features.tfidf import build_tfidf_baseline
 from maude.ingestion.historical_pipeline import ingest_fda_history
 from maude.ingestion.history import download_fda_history as run_fda_history_download
@@ -232,6 +233,23 @@ def build_tfidf(
     typer.echo(
         f"BUILT {result.snapshot_id} {result.feature_version} {counts} "
         f"fit_sample={result.fit_sample_size} output={result.output_directory}"
+    )
+
+
+@app.command("build-signals")
+def build_signals(
+    research_corpus_id: str,
+    data_root: Path | None = typer.Option(  # noqa: B008
+        None, help="Data root containing the composed research corpus; defaults to MAUDE_DATA_ROOT."
+    ),
+) -> None:
+    """Build reported-event and report-volume indicators from a composed research corpus."""
+    settings = Settings.model_validate({}) if data_root is None else Settings(data_root=data_root)
+    result = build_signal_features(settings.data_root, research_corpus_id)
+    typer.echo(
+        f"BUILT {result.research_corpus_id} {result.feature_version} "
+        f"report_cohort_rows={result.report_cohort_rows} "
+        f"volume_cohorts={result.volume_cohort_rows} output={result.output_directory}"
     )
 
 

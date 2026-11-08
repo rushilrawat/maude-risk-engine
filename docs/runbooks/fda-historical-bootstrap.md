@@ -86,8 +86,10 @@ The command verifies that report keys do not overlap between the source master
 tables, streams the source corpora into a deterministic, checksum-bound corpus,
 and records both source snapshot IDs and corpus hashes. It refuses to publish
 when report keys overlap. Use the printed `fda-research-<fingerprint>` ID with
-`maude build-tfidf` and `maude audit-duplicates` for the 2024–2026 temporal
-evaluation. The derived corpus does not modify source snapshots or
+`maude build-signals`, `maude build-tfidf`, and
+`maude audit-duplicates` for the 2024–2026 temporal evaluation. Signal
+generation requires complete monthly coverage across its 12-month baseline and
+3-month recent window. The derived corpus does not modify source snapshots or
 `manifests/current.json`.
 
 ## FDA source and interpretation

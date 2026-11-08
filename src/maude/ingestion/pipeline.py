@@ -40,7 +40,7 @@ from maude.ingestion.archive import inspect_source, select_source_encoding, sha2
 from maude.ingestion.manifests import fsync_directory, load_manifest, write_manifest
 from maude.ingestion.normalize import normalize_bronze
 from maude.ingestion.parser import parse_to_bronze
-from maude.ingestion.reconcile import reconcile_table
+from maude.ingestion.reconcile import RECONCILIATION_VERSION, reconcile_table
 from maude.ingestion.schemas import TABLE_SPECS, SchemaMismatch, spec_for
 from maude.quality.checks import has_blocking_failure, run_quality_checks
 from maude.storage.layout import SnapshotLayout
@@ -427,6 +427,7 @@ def _failed_discovery_snapshot(
         quality=[],
         promoted_path=None,
         parser_version=settings.parser_version,
+        reconciliation_version=RECONCILIATION_VERSION,
         inputs=list(inputs),
         failure=evidence,
     )
@@ -634,6 +635,7 @@ def ingest_snapshot(
             quality=[],
             promoted_path=None,
             parser_version=settings.parser_version,
+            reconciliation_version=RECONCILIATION_VERSION,
             inputs=inputs,
             promotion=PromotionIntent(phase="running"),
         )
@@ -783,6 +785,7 @@ def ingest_role_snapshot(
             quality=(),
             promoted_path=None,
             parser_version=settings.parser_version,
+            reconciliation_version=RECONCILIATION_VERSION,
             inputs=inputs,
             promotion=PromotionIntent(phase="running"),
         )

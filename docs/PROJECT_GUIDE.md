@@ -130,19 +130,20 @@ uv run maude ingest-local local-2025-06 --source-root /path/to/fda-archives
 # Discover and refresh the current official FDA files
 uv run maude refresh-fda
 
-# Build report-level modeling documents from a specific promoted snapshot
-uv run maude build-corpus fda-current-43bedbf20c68c84b
+# Compose fully promoted historical and latest current snapshots
+uv run maude build-research-corpus fda-history-HISTORICAL_FINGERPRINT fda-current-CURRENT_FINGERPRINT
 
-# Fit TF-IDF and batch-transform the 2024 / 2025 / 2026+ periods
-uv run maude build-tfidf fda-current-43bedbf20c68c84b
-
-# Audit repeated report IDs and narrative duplicates across those periods
-uv run maude audit-duplicates fda-current-43bedbf20c68c84b
+# Use the generated fda-research-... ID for downstream analysis
+uv run maude build-signals fda-research-0123456789abcdef
+uv run maude build-tfidf fda-research-0123456789abcdef
+uv run maude audit-duplicates fda-research-0123456789abcdef
 ```
 
 The refresh command uses the configured `MAUDE_DATA_ROOT` and currently takes no
 arguments. Read the runbook before a large download; it describes free-space
 needs, output paths, failure recovery, and warnings.
+Reported-event and volume formulas, windows, and output fields are documented in
+[`signal indicators`](signal-indicators.md).
 
 ## 5. Files to read first
 

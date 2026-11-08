@@ -580,7 +580,7 @@ def _flush_index_batch(
 def _index_corpus(
     connection: sqlite3.Connection,
     corpus_path: Path,
-    snapshot_id: str,
+    source_snapshot_ids: tuple[str, ...],
     cleaning_version: str,
     disk_guard: _DiskSpaceGuard | None = None,
 ) -> tuple[int, int]:
@@ -589,8 +589,8 @@ def _index_corpus(
     narrative_batch: list[tuple[int, str, str, str | None, str | None, str, bytes]] = []
 
     for document in _read_documents(corpus_path):
-        if document.dataset_snapshot_id != snapshot_id:
-            raise ValueError("corpus document snapshot ID does not match its manifest")
+        if document.dataset_snapshot_id not in source_snapshot_ids:
+            raise ValueError("corpus document snapshot ID is not recorded in its manifest")
         split = split_for_received_date(document.date_received)
         for narrative in document.narratives:
             if narrative.report_id != document.report_id:
@@ -885,6 +885,9 @@ def build_duplicate_audit(data_root: Path, snapshot_id: str) -> DuplicateAuditMa
         or corpus_manifest.cleaning_version != NARRATIVE_CLEANING_VERSION
     ):
         raise ValueError("unsupported corpus format or cleaning version")
+    source_snapshot_ids = tuple(corpus_manifest.source_snapshot_ids)
+    if not source_snapshot_ids or len(set(source_snapshot_ids)) != len(source_snapshot_ids):
+        raise ValueError("corpus manifest has invalid source snapshot IDs")
     corpus_path = Path(corpus_manifest.output_path)
     if (
         corpus_path != corpus_directory / "documents.jsonl"
@@ -930,7 +933,7 @@ def build_duplicate_audit(data_root: Path, snapshot_id: str) -> DuplicateAuditMa
             narratives_scanned, missing_date_narratives = _index_corpus(
                 connection,
                 corpus_path,
-                snapshot_id,
+                source_snapshot_ids,
                 corpus_manifest.cleaning_version,
                 disk_guard,
             )

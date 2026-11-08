@@ -17,18 +17,23 @@ from maude.ingestion.fda_catalog import fetch_current_catalog
 from maude.ingestion.http import UrlOpener, open_url
 from maude.ingestion.manifests import load_manifest, write_json_model
 from maude.ingestion.pipeline import ingest_role_snapshot
+from maude.ingestion.reconcile import RECONCILIATION_VERSION
 from maude.storage.layout import RefreshLayout
 
 
-def _fingerprint(artifacts: tuple[DownloadedArtifact, ...]) -> str:
-    identity = [
-        {
-            "table": artifact.table.value,
-            "role": artifact.role.value,
-            "sha256": artifact.sha256,
-        }
-        for artifact in artifacts
-    ]
+def _fingerprint(artifacts: tuple[DownloadedArtifact, ...], parser_version: str) -> str:
+    identity = {
+        "parser_version": parser_version,
+        "reconciliation_version": RECONCILIATION_VERSION,
+        "artifacts": [
+            {
+                "table": artifact.table.value,
+                "role": artifact.role.value,
+                "sha256": artifact.sha256,
+            }
+            for artifact in artifacts
+        ],
+    }
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -86,7 +91,7 @@ def refresh_fda(
             running = running.model_copy(update={"artifacts": tuple(downloaded)})
             write_json_model(layout.run_manifest, running)
         artifacts = tuple(downloaded)
-        fingerprint = _fingerprint(artifacts)
+        fingerprint = _fingerprint(artifacts, settings.parser_version)
         snapshot_id = f"fda-current-{fingerprint[:16]}"
         running = running.model_copy(
             update={"refresh_fingerprint": fingerprint, "snapshot_id": snapshot_id}

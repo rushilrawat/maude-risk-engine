@@ -188,6 +188,7 @@ class SnapshotResult(ContractModel):
     quality: Sequence[QualityResult]
     promoted_path: str | None
     parser_version: str
+    reconciliation_version: str = "role-precedence-v1"
     inputs: Sequence[SourceIdentity] = ()
     source_acquisition_run_id: UUID | None = None
     reconciliation: Sequence[ReconciliationStats] = Field(default_factory=list)
@@ -311,6 +312,46 @@ class ModelingCorpusManifest(ContractModel):
     def require_timezone(cls, value: datetime) -> datetime:
         if value.tzinfo is None:
             raise ValueError("corpus completion timestamp must be timezone-aware")
+        return value
+
+
+class SignalFeatureManifest(ContractModel):
+    """Research-corpus-bound reported-event and report-volume indicators."""
+
+    feature_version: str
+    research_corpus_id: str
+    source_snapshot_ids: tuple[str, ...]
+    research_corpus_manifest_sha256: str
+    source_snapshot_manifest_sha256: Mapping[str, str]
+    output_directory: str
+    cohort_dimension: str
+    report_cohort_rows: int = Field(ge=0)
+    undated_report_cohort_rows: int = Field(ge=0)
+    monthly_cohort_rows: int = Field(ge=0)
+    volume_cohort_rows: int = Field(ge=0)
+    earliest_received_date: date
+    latest_received_date: date
+    latest_source_snapshot_finished_at: datetime
+    latest_complete_month: date
+    recent_window_start: date
+    baseline_window_start: date
+    recent_months: int = Field(ge=1)
+    baseline_months: int = Field(ge=1)
+    minimum_additional_reports: int = Field(ge=0)
+    robust_z_threshold: float = Field(ge=0)
+    robust_z_scale_factor: float = Field(gt=0)
+    mad_zero_scale_floor: float = Field(gt=0)
+    reported_severity_mapping: Mapping[str, str]
+    unknown_event_type_policy: str
+    volume_change_formula: str
+    artifact_sha256: Mapping[str, str]
+    completed_at: datetime
+
+    @field_validator("latest_source_snapshot_finished_at", "completed_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("signal feature timestamps must be timezone-aware")
         return value
 
 

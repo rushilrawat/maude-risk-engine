@@ -142,19 +142,30 @@ files:
 uv run maude refresh-fda
 ```
 
-Build a narrative corpus from an already promoted snapshot:
+Build source corpora from the promoted historical and current snapshots, then
+combine them for temporal evaluation:
 
 ```bash
-uv run maude build-corpus fda-current-43bedbf20c68c84b
+uv run maude build-research-corpus fda-history-HISTORICAL_FINGERPRINT fda-current-CURRENT_FINGERPRINT
 ```
 
-The corpus is written under `MAUDE_DATA_ROOT/corpora/` and keyed by snapshot and
-cleaning version. Existing corpus outputs are verified by checksum and reused.
+Use the generated `fda-research-...` ID for signals, TF-IDF, and duplicate
+audits. The source-specific narrative corpus command remains available for
+single-snapshot inspection.
+
+```bash
+uv run maude build-signals fda-research-0123456789abcdef
+```
+
+The research-corpus-bound outputs and formula metadata are written under
+`MAUDE_DATA_ROOT/features/`. See the
+[indicator methodology](docs/signal-indicators.md); the counts describe FDA
+reporting patterns, not incidence or clinical risk.
 
 Fit the TF-IDF baseline from that corpus:
 
 ```bash
-uv run maude build-tfidf fda-current-43bedbf20c68c84b
+uv run maude build-tfidf fda-research-0123456789abcdef
 ```
 
 The initial research split is training through 2024, validation on 2025, and test
@@ -165,7 +176,7 @@ training period only; generated vectorizers and sparse matrices stay under
 Audit temporal leakage candidates from the same corpus:
 
 ```bash
-uv run maude audit-duplicates fda-current-43bedbf20c68c84b
+uv run maude audit-duplicates fda-research-0123456789abcdef
 ```
 
 The checksum-bound v2 report counts undated narratives, lists exact duplicate

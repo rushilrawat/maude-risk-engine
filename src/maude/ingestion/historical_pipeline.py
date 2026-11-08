@@ -39,7 +39,7 @@ from maude.ingestion.pipeline import (
     _snapshot_claim,
     _validate_promoted_artifacts,
 )
-from maude.ingestion.reconcile import reconcile_table
+from maude.ingestion.reconcile import RECONCILIATION_VERSION, reconcile_table
 from maude.ingestion.schemas import spec_for
 from maude.quality.checks import has_blocking_failure, run_quality_checks
 from maude.storage.layout import SnapshotLayout
@@ -53,12 +53,14 @@ def _sql_literal(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def _snapshot_id(acquisition: HistoricalAcquisitionRun) -> str:
+def _snapshot_id(acquisition: HistoricalAcquisitionRun, parser_version: str) -> str:
     """Derive an immutable ID from the catalog evidence and archive checksums."""
     if acquisition.catalog is None:
         raise HistoricalSnapshotError("acquisition manifest has no FDA catalog evidence")
     identity = {
         "catalog_sha256": acquisition.catalog.sha256,
+        "parser_version": parser_version,
+        "reconciliation_version": RECONCILIATION_VERSION,
         "archives": [
             {
                 "filename": artifact.filename,
@@ -303,7 +305,7 @@ def ingest_fda_history(
     the configured data volume.
     """
     _validate_acquisition(acquisition)
-    snapshot_id = _snapshot_id(acquisition)
+    snapshot_id = _snapshot_id(acquisition, settings.parser_version)
     inputs = tuple(_source_identity(artifact) for artifact in acquisition.artifacts)
     grouped = {
         table: tuple(artifact for artifact in acquisition.artifacts if artifact.table is table)
@@ -346,6 +348,7 @@ def ingest_fda_history(
             quality=(),
             promoted_path=None,
             parser_version=settings.parser_version,
+            reconciliation_version=RECONCILIATION_VERSION,
             inputs=inputs,
             source_acquisition_run_id=acquisition.run_id,
             promotion=PromotionIntent(phase="running"),
